@@ -124,6 +124,25 @@ def _pair_stem(idx: int, pair: Pair) -> str:
     return f"{idx:03d}_{audio_mod.safe_stem(pair.audio.name)}"
 
 
+def _corpus_dir(work_dir: Path) -> Path:
+    """Where prepare_corpus writes the MFA corpus, and where run_alignment
+    points `mfa align` at.
+
+    MUST be named uniquely per run (hence including work_dir.name, itself a
+    random tempfile.mkdtemp() suffix) -- MFA keeps its own persistent
+    working state (a SQLite corpus.db plus scratch files) under
+    ~/Documents/MFA/<corpus folder's NAME>/, keyed by that name alone, not
+    by the full path we pass it. A literal "corpus" here (the old behavior)
+    made every single run of every book collide on the exact same shared
+    MFA-side state: a run interrupted/killed mid-alignment (e.g. by
+    build.ps1's Stop-DistProcesses closing a still-running worker before a
+    rebuild) could leave that shared database locked or inconsistent, and
+    every subsequent run -- of any book -- would then hang or misbehave
+    against that same stale state, regardless of using a fresh work_dir.
+    """
+    return work_dir / f"corpus_{work_dir.name}"
+
+
 def _raw_wav_path(work_dir: Path, idx: int, pair: Pair) -> Path:
     """Where prepare_corpus put this pair's full-length converted WAV.
 
@@ -178,7 +197,7 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
         )
 
     raw_dir = work_dir / "raw"
-    corpus_dir = work_dir / "corpus"
+    corpus_dir = _corpus_dir(work_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     corpus_dir.mkdir(parents=True, exist_ok=True)
 
@@ -498,7 +517,7 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         )
         if not jobs:
             raise RuntimeError("No valid audio/text pairs to align.")
-        corpus_dir = work_dir / "corpus"
+        corpus_dir = _corpus_dir(work_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         alignment_dir = work_dir / "alignment"
