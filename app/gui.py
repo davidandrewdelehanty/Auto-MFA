@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -612,6 +613,62 @@ class AutoMfaApp(tk.Tk):
         self.clipboard_append(text)
 
 
+def _configure_unicode_fonts(root: tk.Tk) -> None:
+    """Point every Tk named font at a family with real Cyrillic (and broad
+    Unicode) glyph coverage.
+
+    Filenames/chapter titles/folder names in this app are routinely
+    Cyrillic (Russian audiobooks). Tk's own default font on some setups --
+    seen on WSL/Linux Tk installs in particular -- has no Cyrillic glyphs
+    at all; the fontconfig fallback path some systems use for that case
+    renders each missing glyph as a small box containing its hex Unicode
+    codepoint, which reads as "random digits" instead of Cyrillic text.
+    Reconfiguring the named fonts (rather than each widget individually)
+    fixes every widget that uses them -- ttk widgets always reference named
+    fonts, and so do classic Listbox/Text/Label/Button/Entry widgets unless
+    given an explicit font tuple.
+    """
+    try:
+        available = set(tkfont.families(root))
+    except tk.TclError:
+        return
+
+    def pick(preferred: list[str]) -> str | None:
+        return next((f for f in preferred if f in available), None)
+
+    ui_family = pick([
+        "Segoe UI",        # Windows -- already has full Cyrillic coverage
+        "Noto Sans",       # common on modern Linux, broad Unicode coverage
+        "DejaVu Sans",     # near-universal on Linux, incl. most WSL images
+        "Liberation Sans",
+        "Arial",
+        "Helvetica",
+    ])
+    mono_family = pick([
+        "Consolas",
+        "DejaVu Sans Mono",
+        "Noto Sans Mono",
+        "Liberation Mono",
+        "Courier New",
+    ])
+
+    if ui_family:
+        for name in (
+            "TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+            "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont",
+            "TkTooltipFont",
+        ):
+            try:
+                tkfont.nametofont(name).configure(family=ui_family)
+            except tk.TclError:
+                pass
+    if mono_family:
+        try:
+            tkfont.nametofont("TkFixedFont").configure(family=mono_family)
+        except tk.TclError:
+            pass
+
+
 def launch() -> None:
     # Create the real root window FIRST. ttk.Style() with no widget passed
     # in looks for an existing Tk root and, if none exists yet, silently
@@ -622,6 +679,7 @@ def launch() -> None:
     # (a tk.Tk subclass) first, then passing it explicitly to Style(),
     # avoids ever creating that phantom root.
     app = AutoMfaApp()
+    _configure_unicode_fonts(app)
     style = ttk.Style(app)
     if "vista" in style.theme_names():
         style.theme_use("vista")
