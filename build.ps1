@@ -56,6 +56,7 @@ if (-not $SkipGui) {
         # check itself was aborting the whole script instead of returning
         # $false like it's supposed to. Flip to "Continue" for just this call
         # so we can inspect $LASTEXITCODE ourselves instead.
+        if (-not $pythonExe) { return $false }
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
@@ -66,36 +67,79 @@ if (-not $SkipGui) {
         return $LASTEXITCODE -eq 0
     }
 
-    if (-not (Test-Path $venvPy)) {
-        $py = (py -$PythonVersion -c "import sys; print(sys.executable)" 2>$null).Trim()
-        if (-not $py) { throw "Python $PythonVersion not found. Run 'py -0p' to list versions." }
-        if (-not (Test-Tkinter $py)) {
-            throw ("Python at '$py' has no working tkinter, so it can't build a Tkinter " +
-                "GUI. Fix: reinstall Python $PythonVersion from https://python.org (the " +
-                "default installer includes 'tcl/tk and IDLE' -- just don't uncheck it " +
-                "under Optional Features), or run 'py -0p' to see what else is installed " +
-                "and pass a different one via -PythonVersion.")
-        }
-        & $py -m venv (Join-Path $root ".venv")
-        if ($LASTEXITCODE -ne 0) { throw "Failed to create venv" }
+    # Run a native command that is EXPECTED to sometimes fail, without the
+    # script-wide "Stop" preference turning its stderr into a fatal error.
+    function Invoke-Probe([scriptblock]$block) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try { & $block } finally { $ErrorActionPreference = $prevEAP }
     }
 
-    if (-not (Test-Tkinter $venvPy)) {
+    # Every Python this machine has, as absolute paths to python.exe.
+    # Some perfectly normal Python installs ship WITHOUT tcl/tk -- notably the
+    # "pythoncore" packages under %LOCALAPPDATA%\Python that winget and the
+    # NuGet feed install, which are deliberately minimal. So rather than
+    # insisting on one hardcoded version, collect every candidate and pick one
+    # that can actually build a Tkinter GUI.
+    function Get-PythonCandidates {
+        $found = New-Object System.Collections.ArrayList
+
+        $requested = $null
+        $out = Invoke-Probe { & py "-$PythonVersion" -c "import sys; print(sys.executable)" 2>$null }
+        if ($out) { $requested = ($out | Select-Object -First 1).ToString().Trim() }
+        if ($requested) { [void]$found.Add($requested) }   # requested version wins
+
+        # Everything else the py launcher knows about.
+        $listing = Invoke-Probe { & py -0p 2>$null }
+        foreach ($line in @($listing)) {
+            if ("$line" -match '([A-Za-z]:\\[^\r\n]*?python\.exe)') {
+                [void]$found.Add($Matches[1].Trim())
+            }
+        }
+
+        # Fallback if the py launcher isn't installed at all.
+        foreach ($name in @("python", "python3")) {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
+            if ($cmd -and $cmd.Source) { [void]$found.Add($cmd.Source) }
+        }
+
+        return ($found | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+    }
+
+    function Resolve-BuildPython {
+        $candidates = @(Get-PythonCandidates)
+        if ($candidates.Count -eq 0) {
+            throw ("No Python installation found. Install Python 3.10+ from " +
+                "https://python.org (keep the default 'tcl/tk and IDLE' option checked).")
+        }
+        foreach ($candidate in $candidates) {
+            if (Test-Tkinter $candidate) { return $candidate }
+        }
+        throw ("None of the Python installations on this machine have a working tkinter, " +
+            "so none can build a Tkinter GUI. Checked:`n  " + ($candidates -join "`n  ") +
+            "`n`nFix: install Python from https://python.org and keep 'tcl/tk and IDLE' " +
+            "checked under Optional Features (the minimal 'pythoncore' builds that winget " +
+            "and the NuGet feed install do not include it). Then re-run this script.")
+    }
+
+    $needVenv = $false
+    if (-not (Test-Path $venvPy)) {
+        $needVenv = $true
+    } elseif (-not (Test-Tkinter $venvPy)) {
         Write-Step "Existing .venv has no working tkinter -- recreating it"
         Remove-Item -Recurse -Force (Join-Path $root ".venv") -ErrorAction SilentlyContinue
-        $py = (py -$PythonVersion -c "import sys; print(sys.executable)" 2>$null).Trim()
-        if (-not $py) { throw "Python $PythonVersion not found. Run 'py -0p' to list versions." }
-        if (-not (Test-Tkinter $py)) {
-            throw ("Python at '$py' has no working tkinter, so it can't build a Tkinter " +
-                "GUI. Fix: reinstall Python $PythonVersion from https://python.org (the " +
-                "default installer includes 'tcl/tk and IDLE' -- just don't uncheck it " +
-                "under Optional Features), or run 'py -0p' to see what else is installed " +
-                "and pass a different one via -PythonVersion.")
-        }
+        $needVenv = $true
+    }
+
+    if ($needVenv) {
+        $py = Resolve-BuildPython
+        Write-Host "Using Python: $py" -ForegroundColor Green
         & $py -m venv (Join-Path $root ".venv")
         if ($LASTEXITCODE -ne 0) { throw "Failed to create venv" }
         if (-not (Test-Tkinter $venvPy)) {
-            throw "Recreated .venv still has no working tkinter -- something is wrong with this Python install."
+            throw ("Created .venv from '$py' but it still has no working tkinter. " +
+                "This usually means that Python's tcl/tk files are present but broken; " +
+                "reinstalling it from https://python.org should fix it.")
         }
     }
 
