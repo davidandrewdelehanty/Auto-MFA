@@ -4,19 +4,25 @@ A GUI app that aligns audiobook audio files to the text of an FB2
 (FictionBook) e-book using **Montreal Forced Aligner (MFA)**, then packages the
 resulting word/phone alignments as one JSON file per audio track inside a zip.
 
-**Recommended: run it under WSL Ubuntu, not native Windows.** MFA wraps
-Kaldi, which is developed and tested primarily on Linux; on native Windows,
-alignment is meaningfully slower (no `fork()`, so every one of Kaldi's many
-short-lived subprocesses pays full Windows process-creation overhead, plus
-Windows Defender scanning freshly-extracted unsigned binaries) and a
-`--num_jobs > 1` bug has been observed silently dropping most of the
-TextGrid export output while still reporting success. Both go away running
-the exact same app under WSL against a normal Linux conda env. See
-[Running under WSL Ubuntu](#running-under-wsl-ubuntu-recommended) below —
-if you don't have WSL yet, https://learn.microsoft.com/en-us/windows/wsl/install
-covers installing it (the GUI itself also links there when running natively
-on Windows). The native-Windows PyInstaller build further down still works
-and is kept for anyone who can't use WSL, but WSL is the better default.
+**Current recommendation: native Windows.** MFA wraps Kaldi, which is
+developed and tested primarily on Linux, so alignment is meaningfully slower
+on native Windows (no `fork()`, so every one of Kaldi's many short-lived
+subprocesses pays full Windows process-creation overhead, plus Windows
+Defender scanning freshly-extracted unsigned binaries) -- WSL Ubuntu was
+tried specifically to fix that, and MFA/Kaldi itself does run correctly
+there. However, the WSLg-hosted Tk GUI hit a separate, unresolved font
+rendering bug (Tk only sees a single system font at all under WSLg on the
+machine this was tested on, so any non-ASCII text -- Cyrillic filenames,
+even this app's own UI symbols -- renders as literal `\uXXXX` escapes
+instead of real characters); several standard fixes (locale, `FONTCONFIG_PATH`,
+installing font packages, even plain Ubuntu's own `python3-tk`) didn't
+resolve it. See [Running under WSL Ubuntu](#running-under-wsl-ubuntu-recommended)
+below if you want to pick that investigation back up. In the meantime, the
+correctness issue that originally motivated trying WSL -- MFA silently
+dropping alignment output on Windows -- is now handled directly:
+`run_pipeline` verifies the expected output exists and retries with
+escalating fallbacks (`--num_jobs 1`, then `--disable_mp`) before failing
+loudly, so native Windows is reliable, just slower per run.
 
 ## How it works
 
@@ -203,9 +209,18 @@ uses the bundled `runtime` instead.)
   silence is found in time is 1.5× this value (45s at the default). Lower it
   if you still see memory pressure; raise it (cautiously) if alignment seems
   too fragmented on very clean, pause-heavy narration.
-- **Parallel jobs**: MFA workers to run concurrently (default 2). Raise it on
-  a machine with more CPU cores/RAM to speed up alignment; lower it to 1 if
-  you're still hitting memory pressure even with short utterances.
+- **Parallel jobs**: MFA workers to run concurrently (default 1). On
+  Windows, MFA has been observed to silently drop most of its own alignment
+  output regardless of this setting -- not specifically a parallel-export
+  bug, more likely Windows' lack of `fork()` (multiprocessing there must use
+  the `spawn` start method, a well-known source of silent subprocess
+  failures fork()-based systems don't hit). The app auto-detects this and
+  retries with escalating fallbacks (`--num_jobs 1`, then `--disable_mp`)
+  regardless of what this is set to, but starting at 1 skips paying for a
+  failed first attempt every time on Windows. Try raising it on a machine
+  with more CPU cores/RAM to speed up alignment (plain `mfa` from a Linux
+  shell hasn't shown this issue at all); keep it at 1 if you hit memory
+  pressure even with short utterances.
 - **Out-of-dictionary words**: MFA auto-uses the Russian g2p model to cover
   words missing from the dictionary. Numbers and punctuation are stripped from
   the transcript before alignment.

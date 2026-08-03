@@ -32,7 +32,17 @@ class AutoMfaApp(tk.Tk):
         self.acoustic_model = tk.StringVar(value="russian_mfa")
         self.dictionary = tk.StringVar(value="russian_mfa")
         self.target_seconds = tk.StringVar(value="30")
-        self.num_jobs = tk.StringVar(value="2")
+        # Default to 1: on Windows, MFA has been observed to silently drop
+        # most of its own output (e.g. 5 TextGrids written out of 29
+        # expected) while still reporting success, regardless of
+        # --num_jobs -- this is a Windows multiprocessing-pool issue, not
+        # specifically about parallel export (see run_pipeline's automatic
+        # detect + escalating retry in pipeline.py, which stays in place as
+        # a safety net either way). Raise this back to 2+ in the field below
+        # if you want to try it -- alignment itself is faster with more
+        # jobs when it works, the auto-retry will still catch it if it
+        # doesn't.
+        self.num_jobs = tk.StringVar(value="1")
         self.auto_download = tk.BooleanVar(value=True)
         self.keep_temp = tk.BooleanVar(value=False)
 

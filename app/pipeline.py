@@ -247,7 +247,7 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
 
 def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
                   dictionary: str, acoustic: str, log: LogFn,
-                  num_jobs: int = 2) -> None:
+                  num_jobs: int = 2, disable_mp: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_args = [
         "align",
@@ -261,6 +261,15 @@ def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
         "--single_speaker",   # one narrator; also disables speaker adaptation
         "--num_jobs", str(max(1, num_jobs)),
     ]
+    if disable_mp:
+        # See run_pipeline's escalating-retry comment for the full story:
+        # --num_jobs alone only controls how many corpus splits MFA uses
+        # *within* multiprocessing -- MFA still spawns a worker pool even
+        # at --num_jobs 1. --disable_mp is a separate toggle that turns
+        # that pool off entirely, forcing fully sequential execution.
+        # Slower, but sidesteps whatever is silently losing output in
+        # MFA's own worker-pool coordination on Windows.
+        base_args.append("--disable_mp")
     use_g2p = model_present("g2p", dictionary)
     if not use_g2p:
         log("Note: no g2p model available for this dictionary; words "
@@ -530,35 +539,49 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         progress(0.0, "aligning")
         run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
                      log, num_jobs=num_jobs)
-        # MFA has been observed, on Windows, to report a fully successful
-        # run ("Finished exporting TextGrids...!", "Done!") while its own
-        # parallel (--num_jobs > 1) export step silently drops most of the
-        # output -- e.g. 5 TextGrids written out of 29 expected, with no
-        # error or warning anywhere in its log. This looks like a
-        # Windows-specific race in MFA/Kaldi's own worker-pool
-        # coordination (far less exercised there than on Linux/Mac), not
-        # anything wrong with our corpus or arguments -- the alignment
-        # itself completes fine, only the final per-job export step loses
-        # work. Rather than fail the whole run over it, verify the expected
-        # output actually exists and, if some is missing, retry once with
-        # --num_jobs 1 (slower, but avoids whatever the parallel export
-        # path is racing on) before giving up for real.
+        # MFA has been observed, on Windows, to report a fully successful run
+        # ("Finished exporting TextGrids...!", "Done!") while some of its
+        # internal steps silently drop most of their own output -- e.g. 5
+        # TextGrids written out of 29 expected, with no error or warning
+        # anywhere in its log. This was first assumed to be a race specific
+        # to --num_jobs > 1's parallel export, but retrying at --num_jobs 1
+        # reproduced the *exact same* failure (same 5/29, same first missing
+        # file) -- ruling that theory out. --num_jobs only controls how many
+        # corpus splits MFA uses; it has a SEPARATE multiprocessing toggle
+        # (--disable_mp) for whether it uses a worker pool AT ALL for its
+        # internal steps -- even a single corpus-split still goes through
+        # that pool. Windows has no fork() (multiprocessing must use the
+        # `spawn` start method there), a well-known source of silent
+        # subprocess/pickling failures that fork()-based Linux/Mac never
+        # hit -- which also fits why this was never seen running the same
+        # MFA under Ubuntu bash. So: verify the expected output actually
+        # exists and, if some is missing, retry with escalating fallbacks
+        # (skipping any tier that matches args already tried) before giving
+        # up for real.
         missing = _missing_textgrids(alignment_dir, jobs)
-        if missing and num_jobs != 1:
+        tried = {(num_jobs, False)}
+        for tier_jobs, tier_disable_mp in ((1, False), (1, True)):
+            if not missing:
+                break
+            if (tier_jobs, tier_disable_mp) in tried:
+                continue
+            tried.add((tier_jobs, tier_disable_mp))
+            extra = " --disable_mp" if tier_disable_mp else ""
             log(f"Warning: MFA reported success but {len(missing)}/{len(jobs)} "
-                f"expected TextGrid files are missing (a known MFA issue with "
-                f"parallel export on Windows). Retrying alignment with "
-                f"--num_jobs 1 -- this will take longer.")
+                f"expected TextGrid files are missing (not flagged as an "
+                f"error anywhere in MFA's own log). Retrying alignment with "
+                f"--num_jobs {tier_jobs}{extra} -- this will take longer.")
             run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
-                         acoustic, log, num_jobs=1)
+                         acoustic, log, num_jobs=tier_jobs,
+                         disable_mp=tier_disable_mp)
             missing = _missing_textgrids(alignment_dir, jobs)
         if missing:
             raise RuntimeError(
                 f"MFA did not produce {len(missing)}/{len(jobs)} expected "
-                f"TextGrid files even after a --num_jobs 1 retry (first "
-                f"missing: {Path(missing[0].wav).stem}.TextGrid). This "
-                f"looks like a deeper MFA/corpus issue, not a transient "
-                f"parallel-export race."
+                f"TextGrid files even after retrying with --num_jobs 1 and "
+                f"--disable_mp (first missing: "
+                f"{Path(missing[0].wav).stem}.TextGrid). This looks like a "
+                f"deeper MFA/corpus issue, not a transient export race."
             )
         progress(0.9, "building JSON")
         results = postprocess(alignment_dir, pairs, jobs, log,
