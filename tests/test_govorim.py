@@ -207,7 +207,8 @@ class PipelineGovorimModeTest(unittest.TestCase):
 
             def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
                                    dictionary, acoustic, log, num_jobs=2,
-                                   disable_mp=False):
+                                   dictionary_path=None, beam=None,
+                                   retry_beam=None):
                 Path(alignment_dir).mkdir(parents=True, exist_ok=True)
                 tg = Path(alignment_dir) / "000_a_000.TextGrid"
                 tg.write_text(
@@ -225,6 +226,7 @@ class PipelineGovorimModeTest(unittest.TestCase):
                     encoding="utf-8")
 
             with mock.patch("app.pipeline.ensure_models"), \
+                 mock.patch("app.pipeline.build_dictionary", return_value=None), \
                  mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
                  mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
                 result = run_pipeline(

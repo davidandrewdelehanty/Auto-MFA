@@ -22,6 +22,15 @@ from .textgrid import parse_textgrid
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float, str], None]
 
+# Share of segments that must align for a run to be considered usable.
+# MFA leaves a small number of utterances unaligned as a matter of course
+# (beam failures where audio and transcript diverge locally) -- chasing
+# those costs a full re-run for files that will fail again, and a gap in
+# one 30s window is far less bad than no output at all. Anything well
+# below this is not a beam problem but a corpus problem, and should be
+# reported as such instead of quietly producing a mangled book.
+MIN_ALIGNED_RATIO = 0.90
+
 
 @dataclass
 class Pair:
@@ -252,14 +261,103 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
     return jobs
 
 
+def base_dictionary_path(dictionary: str) -> Optional[Path]:
+    """On-disk path of a downloaded pretrained dictionary, if present."""
+    candidate = (mfa_data_dir() / "pretrained_models" / "dictionary"
+                 / f"{dictionary}.dict")
+    return candidate if candidate.is_file() else None
+
+
+def build_dictionary(corpus_dir: Path, dictionary: str, work_dir: Path,
+                     log: LogFn) -> Optional[Path]:
+    """Build a book-specific dictionary: the base one plus g2p-generated
+    pronunciations for every word in THIS corpus that it doesn't cover.
+
+    This is the single most important step for alignment quality, and
+    getting it wrong is what makes MFA quietly fail to align most of a
+    book. Russian audiobooks are full of out-of-vocabulary words --
+    character names in every grammatical case, French phrases, years --
+    and those names *recur constantly*, so leaving them unpronounceable
+    doesn't just lose those words: it strips the alignment of its most
+    frequent anchors, and whole utterances then fail beam search and
+    produce no output at all. MFA reports that as a completely successful
+    run with fewer files exported than it was given.
+
+    The obvious-looking alternative, passing ``--g2p_model_path`` to
+    ``mfa align`` and letting it do this internally, is what this app used
+    to do. It is worse in two ways: MFA has shipped g2p models whose phone
+    inventory doesn't match their own paired dictionary (align then refuses
+    to run at all with PronunciationG2PMismatchError), and the natural
+    fallback -- dropping g2p -- silently lands you in exactly the
+    no-pronunciations state described above.
+
+    Returns the merged dictionary's path, or None if it couldn't be built
+    (in which case the caller should fall back to the plain base
+    dictionary rather than failing the run).
+    """
+    base = base_dictionary_path(dictionary)
+    if base is None:
+        log(f"Note: no on-disk copy of dictionary '{dictionary}' to extend; "
+            f"using it as-is. Out-of-vocabulary words (character names, "
+            f"foreign phrases) may fail to align.")
+        return None
+    if not model_present("g2p", dictionary):
+        log(f"Note: no g2p model for '{dictionary}', so out-of-vocabulary "
+            f"words cannot be given pronunciations. Alignment will still "
+            f"run, but expect segments containing names to fail.")
+        return None
+
+    oov_dict = work_dir / "oov.dict"
+    merged = work_dir / "book.dict"
+    log("Generating pronunciations for out-of-vocabulary words (names, "
+        "foreign phrases)...")
+    try:
+        invoke_mfa(["g2p", str(corpus_dir), dictionary, str(oov_dict),
+                    "--dictionary_path", dictionary], log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Warning: could not generate OOV pronunciations ({exc}). "
+            f"Falling back to the base dictionary; segments containing "
+            f"names may fail to align.")
+        return None
+
+    try:
+        base_text = base.read_text(encoding="utf-8")
+        oov_text = oov_dict.read_text(encoding="utf-8") if oov_dict.is_file() else ""
+        if not oov_text.strip():
+            log("  No out-of-vocabulary words found; using the base dictionary.")
+            return None
+        if not base_text.endswith("\n"):
+            base_text += "\n"
+        merged.write_text(base_text + oov_text, encoding="utf-8")
+    except OSError as exc:
+        log(f"Warning: could not merge the OOV dictionary ({exc}); "
+            f"using the base dictionary.")
+        return None
+
+    n_oov = sum(1 for line in oov_text.splitlines() if line.strip())
+    log(f"  Added {n_oov} pronunciation(s) for this book -> {merged.name}")
+    return merged
+
+
 def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
                   dictionary: str, acoustic: str, log: LogFn,
-                  num_jobs: int = 2, disable_mp: bool = False) -> None:
+                  num_jobs: int = 2,
+                  dictionary_path: Optional[Path] = None,
+                  beam: Optional[int] = None,
+                  retry_beam: Optional[int] = None) -> None:
+    """Run one ``mfa align`` pass.
+
+    *dictionary_path*, when given, is used INSTEAD of the named
+    dictionary -- normally the merged book dictionary from
+    build_dictionary(). No ``--g2p_model_path`` is passed: pronunciations
+    are baked into that dictionary already (see build_dictionary for why
+    that ordering matters).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_args = [
+    args = [
         "align",
         str(corpus_dir),
-        dictionary,
+        str(dictionary_path) if dictionary_path else dictionary,
         acoustic,
         str(output_dir),
         "--clean",
@@ -268,39 +366,14 @@ def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
         "--single_speaker",   # one narrator; also disables speaker adaptation
         "--num_jobs", str(max(1, num_jobs)),
     ]
-    if disable_mp:
-        # See run_pipeline's escalating-retry comment for the full story:
-        # --num_jobs alone only controls how many corpus splits MFA uses
-        # *within* multiprocessing -- MFA still spawns a worker pool even
-        # at --num_jobs 1. --disable_mp is a separate toggle that turns
-        # that pool off entirely, forcing fully sequential execution.
-        # Slower, but sidesteps whatever is silently losing output in
-        # MFA's own worker-pool coordination on Windows.
-        base_args.append("--disable_mp")
-    use_g2p = model_present("g2p", dictionary)
-    if not use_g2p:
-        log("Note: no g2p model available for this dictionary; words "
-            "missing from it will not align.")
-    args = base_args + (["--g2p_model_path", dictionary] if use_g2p else [])
-    try:
-        invoke_mfa(args, log)
-    except Exception as exc:
-        # MFA's pretrained model server has, at times, served a g2p model
-        # whose phone inventory doesn't match its paired dictionary's (a
-        # versioning issue on MFA's end, not something this app can fix by
-        # re-downloading). MFA refuses to align AT ALL when that happens,
-        # even though the mismatch only affects out-of-dictionary words.
-        # g2p coverage is already documented as best-effort elsewhere (see
-        # ensure_models: a failed g2p *download* doesn't block alignment) --
-        # apply the same fallback here: drop g2p and retry once, rather than
-        # failing the whole run over words g2p would have covered anyway.
-        if use_g2p and "PronunciationG2PMismatchError" in str(exc):
-            log(f"Warning: the downloaded g2p model is incompatible with "
-                f"this dictionary ({exc}). Retrying without g2p -- words "
-                f"missing from the dictionary will not align.")
-            invoke_mfa(base_args, log)
-        else:
-            raise
+    # Widening the beam is MFA's documented remedy for utterances that fail
+    # to align; a failed utterance produces no output file at all, which is
+    # why this matters more than it sounds.
+    if beam:
+        args += ["--beam", str(beam)]
+    if retry_beam:
+        args += ["--retry_beam", str(retry_beam)]
+    invoke_mfa(args, log)
 
 
 def _shift(tiers: Dict[str, List[Dict]], offset: float) -> Dict[str, List[Dict]]:
@@ -453,7 +526,19 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
         for job in pair_jobs:
             tg_path = Path(output_dir) / f"{Path(job.wav).stem}.TextGrid"
             if not tg_path.exists():
-                raise FileNotFoundError(f"Expected alignment output: {tg_path}")
+                # A segment MFA could not align produces no file at all.
+                # That is a normal, low-rate occurrence (a stretch where
+                # audio and transcript diverge), so don't fail the book
+                # over it: skip its words but STILL advance the offset by
+                # this segment's planned duration, so every later segment
+                # in the chapter keeps its correct position. The result is
+                # a gap in the timings rather than everything after it
+                # drifting early.
+                log(f"  Warning: no alignment for '{Path(job.wav).stem}' "
+                    f"({job.duration:.1f}s) -- leaving a gap and continuing.")
+                offset += job.duration
+                duration += job.duration
+                continue
             parsed = parse_textgrid(tg_path)
             shifted = _shift(parsed["tiers"], offset)
             for name, intervals in shifted.items():
@@ -561,6 +646,18 @@ def _missing_textgrids(alignment_dir: Path, jobs: List[CorpusJob]) -> List[Corpu
             if not (Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid").exists()]
 
 
+def _enough_aligned(aligned: int, total: int) -> bool:
+    """Whether *aligned* of *total* segments clears MIN_ALIGNED_RATIO.
+
+    The epsilon is load-bearing: written the obvious way, one miss out of
+    ten fails a 90% threshold, because 10 * (1 - 0.90) is 0.9999999999999998
+    in binary floating point, not 1.0.
+    """
+    if total <= 0:
+        return False
+    return aligned >= total * MIN_ALIGNED_RATIO - 1e-9
+
+
 def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                  output_dir: Path,
                  zip_name: Optional[str] = None,
@@ -595,52 +692,56 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         alignment_dir = work_dir / "alignment"
         temp_dir = work_dir / "mfa_temp"
         progress(0.0, "aligning")
+        book_dict = build_dictionary(corpus_dir, dictionary, work_dir, log)
         run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
-                     log, num_jobs=num_jobs)
-        # MFA has been observed, on Windows, to report a fully successful run
-        # ("Finished exporting TextGrids...!", "Done!") while some of its
-        # internal steps silently drop most of their own output -- e.g. 5
-        # TextGrids written out of 29 expected, with no error or warning
-        # anywhere in its log. This was first assumed to be a race specific
-        # to --num_jobs > 1's parallel export, but retrying at --num_jobs 1
-        # reproduced the *exact same* failure (same 5/29, same first missing
-        # file) -- ruling that theory out. --num_jobs only controls how many
-        # corpus splits MFA uses; it has a SEPARATE multiprocessing toggle
-        # (--disable_mp) for whether it uses a worker pool AT ALL for its
-        # internal steps -- even a single corpus-split still goes through
-        # that pool. Windows has no fork() (multiprocessing must use the
-        # `spawn` start method there), a well-known source of silent
-        # subprocess/pickling failures that fork()-based Linux/Mac never
-        # hit -- which also fits why this was never seen running the same
-        # MFA under Ubuntu bash. So: verify the expected output actually
-        # exists and, if some is missing, retry with escalating fallbacks
-        # (skipping any tier that matches args already tried) before giving
-        # up for real.
+                     log, num_jobs=num_jobs, dictionary_path=book_dict)
+        # An utterance MFA cannot align produces NO output file, and MFA
+        # still reports the run as fully successful -- so "fewer files than
+        # expected" is the only signal that anything went wrong. A small
+        # number of these is normal (a stretch where audio and transcript
+        # diverge). A large number means something systematic: almost
+        # always out-of-vocabulary words with no pronunciation, which
+        # build_dictionary above exists to prevent.
+        #
+        # Widening the beam is MFA's documented remedy for the leftovers,
+        # so retry the whole pass with a wider beam before giving up, then
+        # once more single-job (which also covers the memory-pressure case,
+        # since an OOM-killed job likewise just leaves files missing).
         missing = _missing_textgrids(alignment_dir, jobs)
-        tried = {(num_jobs, False)}
-        for tier_jobs, tier_disable_mp in ((1, False), (1, True)):
-            if not missing:
+        tiers = [
+            {"beam": 100, "retry_beam": 400, "num_jobs": num_jobs},
+            {"beam": 100, "retry_beam": 400, "num_jobs": 1},
+        ]
+        for tier in tiers:
+            if _enough_aligned(len(jobs) - len(missing), len(jobs)):
                 break
-            if (tier_jobs, tier_disable_mp) in tried:
-                continue
-            tried.add((tier_jobs, tier_disable_mp))
-            extra = " --disable_mp" if tier_disable_mp else ""
-            log(f"Warning: MFA reported success but {len(missing)}/{len(jobs)} "
-                f"expected TextGrid files are missing (not flagged as an "
-                f"error anywhere in MFA's own log). Retrying alignment with "
-                f"--num_jobs {tier_jobs}{extra} -- this will take longer.")
+            log(f"Warning: {len(missing)}/{len(jobs)} segments produced no "
+                f"alignment (MFA reports this as a successful run). Retrying "
+                f"with --beam {tier['beam']} --retry_beam {tier['retry_beam']} "
+                f"--num_jobs {tier['num_jobs']} -- this will take longer.")
             run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
-                         acoustic, log, num_jobs=tier_jobs,
-                         disable_mp=tier_disable_mp)
+                         acoustic, log, num_jobs=tier["num_jobs"],
+                         dictionary_path=book_dict, beam=tier["beam"],
+                         retry_beam=tier["retry_beam"])
             missing = _missing_textgrids(alignment_dir, jobs)
-        if missing:
+
+        aligned = len(jobs) - len(missing)
+        ratio = aligned / len(jobs) if jobs else 0.0
+        if not _enough_aligned(aligned, len(jobs)):
             raise RuntimeError(
-                f"MFA did not produce {len(missing)}/{len(jobs)} expected "
-                f"TextGrid files even after retrying with --num_jobs 1 and "
-                f"--disable_mp (first missing: "
-                f"{Path(missing[0].wav).stem}.TextGrid). This looks like a "
-                f"deeper MFA/corpus issue, not a transient export race."
+                f"Only {aligned}/{len(jobs)} segments aligned ({ratio:.0%}) "
+                f"even after retrying with a wider beam. That is too low to "
+                f"produce usable timings.\n\n"
+                f"The usual cause is a transcript that doesn't match the "
+                f"audio: a preamble or endnotes section in the FB2 that "
+                f"isn't read aloud, an abridged recording, or the wrong "
+                f"chapter paired to a file. Check the pairing, and check "
+                f"whether this FB2 contains sections the narrator skips."
             )
+        if missing:
+            log(f"Note: {len(missing)}/{len(jobs)} segments could not be "
+                f"aligned ({ratio:.1%} aligned). Their words are left out; "
+                f"surrounding timings are unaffected.")
         progress(0.9, "building JSON")
         results = postprocess(alignment_dir, pairs, jobs, log,
                               work_dir=work_dir, ffmpeg=ffmpeg)

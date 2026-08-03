@@ -26,8 +26,8 @@ from pathlib import Path
 from unittest import mock
 
 from app.pipeline import (
-    CorpusJob, Pair, model_present, postprocess, prepare_corpus,
-    run_alignment, run_pipeline, write_zip,
+    CorpusJob, Pair, build_dictionary, model_present, postprocess,
+    prepare_corpus, run_alignment, run_pipeline, write_zip,
 )
 from app import audio as audio_mod
 
@@ -346,29 +346,82 @@ class ModelPresentTest(unittest.TestCase):
         self.assertFalse(model_present("dictionary", "russian_mfa"))
 
 
-class RunAlignmentG2PFallbackTest(unittest.TestCase):
-    """Regression test: MFA's pretrained model server has, at times, served
-    a g2p model whose phone inventory doesn't match its paired dictionary,
-    and MFA refuses to align AT ALL when that happens -- even though only
-    out-of-dictionary words are affected. run_alignment should retry once
-    without --g2p_model_path instead of failing the whole run.
+class BuildDictionaryTest(unittest.TestCase):
+    """The book-specific dictionary is the difference between most of a
+    book aligning and most of it silently producing nothing.
+
+    An utterance containing a word with no pronunciation fails beam search
+    and produces NO output file, while MFA still reports the run as fully
+    successful. Russian audiobooks are dense with out-of-vocabulary words
+    (character names in every case, French, years) that recur constantly,
+    so this is not a marginal loss -- it takes out whole segments.
     """
 
-    def test_retries_without_g2p_on_mismatch(self):
-        calls = []
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.mfa_root = self.root / "mfa"
+        dict_dir = self.mfa_root / "pretrained_models" / "dictionary"
+        dict_dir.mkdir(parents=True)
+        self.base_dict = dict_dir / "russian_mfa.dict"
+        self.base_dict.write_text("привет\tp rʲ i vʲ e t\n", encoding="utf-8")
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ["MFA_ROOT_DIR"] = str(self.mfa_root)
+
+    def test_merges_g2p_output_onto_the_base_dictionary(self):
+        work = self.root / "work"
+        work.mkdir()
 
         def fake_invoke_mfa(args, log):
-            calls.append(list(args))
-            if len(calls) == 1:
-                raise RuntimeError(
-                    "PronunciationG2PMismatchError:\n"
-                    "There were phones in the G2P model that are not in "
-                    "the dictionary: \nɕ"
-                )
+            # `mfa g2p <corpus> <model> <out> --dictionary_path <dict>`
+            Path(args[3]).write_text("болконский\tb ɐ ɫ k o n s kʲ ɪ j\n",
+                                     encoding="utf-8")
+            return 0
+
+        with mock.patch("app.pipeline.model_present", return_value=True), \
+             mock.patch("app.pipeline.invoke_mfa", side_effect=fake_invoke_mfa):
+            merged = build_dictionary(self.root / "corpus", "russian_mfa",
+                                      work, log=lambda m: None)
+
+        self.assertIsNotNone(merged)
+        text = merged.read_text(encoding="utf-8")
+        self.assertIn("привет", text)       # base entries kept
+        self.assertIn("болконский", text)   # OOV entries appended
+
+    def test_falls_back_to_base_dictionary_when_g2p_fails(self):
+        work = self.root / "work"
+        work.mkdir()
+
+        def boom(args, log):
+            raise RuntimeError("PronunciationG2PMismatchError: ...")
+
+        with mock.patch("app.pipeline.model_present", return_value=True), \
+             mock.patch("app.pipeline.invoke_mfa", side_effect=boom):
+            merged = build_dictionary(self.root / "corpus", "russian_mfa",
+                                      work, log=lambda m: None)
+
+        # None means "use the plain dictionary" -- a degraded run beats no run.
+        self.assertIsNone(merged)
+
+    def test_no_g2p_model_means_no_merged_dictionary(self):
+        work = self.root / "work"
+        work.mkdir()
+        with mock.patch("app.pipeline.model_present", return_value=False):
+            self.assertIsNone(build_dictionary(
+                self.root / "corpus", "russian_mfa", work, log=lambda m: None))
+
+
+class RunAlignmentArgsTest(unittest.TestCase):
+    def _args_for(self, **kw):
+        captured = {}
+
+        def fake_invoke_mfa(args, log):
+            captured["args"] = list(args)
             return 0
 
         with tempfile.TemporaryDirectory() as d, \
-                mock.patch("app.pipeline.model_present", return_value=True), \
                 mock.patch("app.pipeline.invoke_mfa", side_effect=fake_invoke_mfa):
             run_alignment(
                 corpus_dir=Path(d) / "corpus",
@@ -377,37 +430,45 @@ class RunAlignmentG2PFallbackTest(unittest.TestCase):
                 dictionary="russian_mfa",
                 acoustic="russian_mfa",
                 log=lambda msg: None,
+                **kw,
             )
+        return captured["args"]
 
-        self.assertEqual(len(calls), 2)
-        self.assertIn("--g2p_model_path", calls[0])
-        self.assertNotIn("--g2p_model_path", calls[1])
+    def test_never_passes_g2p_model_path(self):
+        """Pronunciations come from the merged dictionary instead.
 
-    def test_other_errors_are_not_swallowed(self):
-        def fake_invoke_mfa(args, log):
-            raise RuntimeError("some unrelated MFA failure")
+        --g2p_model_path is what triggered PronunciationG2PMismatchError,
+        and the natural fallback (dropping it) left OOV words with no
+        pronunciation at all -- the very thing that breaks alignment.
+        """
+        self.assertNotIn("--g2p_model_path", self._args_for())
 
-        with tempfile.TemporaryDirectory() as d, \
-                mock.patch("app.pipeline.model_present", return_value=True), \
-                mock.patch("app.pipeline.invoke_mfa", side_effect=fake_invoke_mfa):
-            with self.assertRaises(RuntimeError):
-                run_alignment(
-                    corpus_dir=Path(d) / "corpus",
-                    output_dir=Path(d) / "align",
-                    temp_dir=Path(d) / "temp",
-                    dictionary="russian_mfa",
-                    acoustic="russian_mfa",
-                    log=lambda msg: None,
-                )
+    def test_uses_the_merged_dictionary_when_given(self):
+        args = self._args_for(dictionary_path=Path("/tmp/book.dict"))
+        self.assertIn("/tmp/book.dict", args)
+        # positional dictionary slot, not an extra flag
+        self.assertEqual(args[2], "/tmp/book.dict")
+
+    def test_falls_back_to_the_named_dictionary(self):
+        self.assertEqual(self._args_for()[2], "russian_mfa")
+
+    def test_beam_settings_are_passed_through(self):
+        args = self._args_for(beam=100, retry_beam=400)
+        self.assertIn("--beam", args)
+        self.assertIn("100", args)
+        self.assertIn("--retry_beam", args)
+        self.assertIn("400", args)
+
+    def test_no_beam_flags_by_default(self):
+        args = self._args_for()
+        self.assertNotIn("--beam", args)
+        self.assertNotIn("--retry_beam", args)
 
 
-class ParallelExportDroppedFilesTest(unittest.TestCase):
-    """Regression test: MFA has been observed, on Windows, to report a
-    fully successful run while silently dropping most of its own alignment
-    output -- e.g. 5 files written out of 29 expected, no error anywhere in
-    MFA's own log. This reproduces identically at --num_jobs 1 (ruling out
-    a parallel-export-specific race), so run_pipeline escalates through
-    --num_jobs 1, then --num_jobs 1 --disable_mp, before giving up.
+class UnalignedSegmentsTest(unittest.TestCase):
+    """An utterance MFA cannot align produces NO output file, while MFA
+    still reports the run as fully successful. A few of those is normal; a
+    lot of them means a corpus problem, not a beam problem.
     """
 
     def _job(self, work_dir, i, n_words=2):
@@ -416,139 +477,105 @@ class ParallelExportDroppedFilesTest(unittest.TestCase):
         txt.write_text(" ".join(f"w{i}_{k}" for k in range(n_words)), encoding="utf-8")
         return CorpusJob(0, i, str(wav), str(txt), duration=1.0)
 
-    def test_retries_with_num_jobs_1_and_succeeds(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            work_dir = root / "work"
-            work_dir.mkdir()
-            out_dir = root / "out"
-            jobs = [self._job(work_dir, i) for i in range(4)]
-            calls = []
+    def _run(self, writer, n_jobs=10, num_jobs=2, **kw):
+        """Run the pipeline with run_alignment replaced by *writer*.
 
-            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
-                                   dictionary, acoustic, log, num_jobs=2,
-                                   disable_mp=False):
-                calls.append((num_jobs, disable_mp))
-                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
-                # First (parallel) attempt: only half the files "export".
-                # Retry (num_jobs=1): all of them do.
-                written = jobs if num_jobs == 1 else jobs[:2]
-                for j in written:
-                    words = Path(j.txt).read_text(encoding="utf-8").split()
-                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
-                    tg.write_text(fake_textgrid(words), encoding="utf-8")
-
-            with mock.patch("app.pipeline.ensure_models"), \
-                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
-                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
-                zip_path = run_pipeline(
-                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
-                    acoustic="russian_mfa", dictionary="russian_mfa",
-                    output_dir=out_dir, num_jobs=2, log=print,
-                )
-
-            # parallel attempt, then num_jobs=1 retry -- never needs to
-            # escalate to --disable_mp since the num_jobs=1 retry succeeds.
-            self.assertEqual(calls, [(2, False), (1, False)])
-            self.assertTrue(zip_path.exists())
-
-    def test_escalates_to_disable_mp_if_num_jobs_1_also_fails(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            work_dir = root / "work"
-            work_dir.mkdir()
-            out_dir = root / "out"
-            jobs = [self._job(work_dir, i) for i in range(4)]
-            calls = []
-
-            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
-                                   dictionary, acoustic, log, num_jobs=2,
-                                   disable_mp=False):
-                calls.append((num_jobs, disable_mp))
-                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
-                # Only --disable_mp actually gets everything written --
-                # num_jobs=1 alone reproduces the same partial failure as
-                # the initial attempt (this is the case that ruled out a
-                # parallel-export-specific race in the first place).
-                written = jobs if disable_mp else jobs[:2]
-                for j in written:
-                    words = Path(j.txt).read_text(encoding="utf-8").split()
-                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
-                    tg.write_text(fake_textgrid(words), encoding="utf-8")
-
-            with mock.patch("app.pipeline.ensure_models"), \
-                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
-                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
-                zip_path = run_pipeline(
-                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
-                    acoustic="russian_mfa", dictionary="russian_mfa",
-                    output_dir=out_dir, num_jobs=2, log=print,
-                )
-
-            self.assertEqual(calls, [(2, False), (1, False), (1, True)])
-            self.assertTrue(zip_path.exists())
-
-    def test_raises_clearly_if_all_retries_fail(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            work_dir = root / "work"
-            work_dir.mkdir()
-            out_dir = root / "out"
-            jobs = [self._job(work_dir, i) for i in range(4)]
-
-            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
-                                   dictionary, acoustic, log, num_jobs=2,
-                                   disable_mp=False):
-                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
-                # Never writes anything, regardless of args.
-
-            with mock.patch("app.pipeline.ensure_models"), \
-                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
-                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
-                with self.assertRaises(RuntimeError) as ctx:
-                    run_pipeline(
-                        pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
-                        acoustic="russian_mfa", dictionary="russian_mfa",
-                        output_dir=out_dir, num_jobs=2, log=print,
-                    )
-            self.assertIn("4/4", str(ctx.exception))
-
-    def test_num_jobs_1_start_skips_straight_to_disable_mp_retry(self):
-        """If the caller already starts at num_jobs=1 (the GUI's new
-        default), the num_jobs=1 tier is identical to what was already
-        tried -- run_pipeline should skip straight to --disable_mp instead
-        of wastefully repeating the exact same failing call.
+        Returns (result, calls) where calls records each alignment attempt's
+        (num_jobs, beam) so the escalation can be asserted on.
         """
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            work_dir = root / "work"
-            work_dir.mkdir()
-            out_dir = root / "out"
-            jobs = [self._job(work_dir, i) for i in range(4)]
-            calls = []
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work_dir = root / "work"
+        work_dir.mkdir()
+        out_dir = root / "out"
+        jobs = [self._job(work_dir, i) for i in range(n_jobs)]
+        calls = []
 
-            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
-                                   dictionary, acoustic, log, num_jobs=2,
-                                   disable_mp=False):
-                calls.append((num_jobs, disable_mp))
-                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
-                written = jobs if disable_mp else jobs[:2]
-                for j in written:
-                    words = Path(j.txt).read_text(encoding="utf-8").split()
-                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
-                    tg.write_text(fake_textgrid(words), encoding="utf-8")
+        def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
+                               dictionary, acoustic, log, num_jobs=2,
+                               dictionary_path=None, beam=None,
+                               retry_beam=None):
+            calls.append((num_jobs, beam))
+            Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+            for j in writer(jobs, beam):
+                words = Path(j.txt).read_text(encoding="utf-8").split()
+                tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
+                tg.write_text(fake_textgrid(words), encoding="utf-8")
 
-            with mock.patch("app.pipeline.ensure_models"), \
-                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
-                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
-                zip_path = run_pipeline(
-                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
-                    acoustic="russian_mfa", dictionary="russian_mfa",
-                    output_dir=out_dir, num_jobs=1, log=print,
-                )
+        with mock.patch("app.pipeline.ensure_models"), \
+             mock.patch("app.pipeline.build_dictionary", return_value=None), \
+             mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+             mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
+            result = run_pipeline(
+                pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
+                acoustic="russian_mfa", dictionary="russian_mfa",
+                output_dir=out_dir, num_jobs=num_jobs, log=lambda m: None,
+                **kw,
+            )
+        return result, calls
 
-            self.assertEqual(calls, [(1, False), (1, True)])
-            self.assertTrue(zip_path.exists())
+    def test_a_few_unaligned_segments_do_not_fail_the_run(self):
+        # 9/10 aligned is above the tolerance: produce output, don't retry.
+        result, calls = self._run(lambda jobs, beam: jobs[:9])
+        self.assertTrue(result.exists())
+        self.assertEqual(len(calls), 1, "should not retry a tolerable miss")
+
+    def test_widens_the_beam_when_many_segments_fail(self):
+        # Only the wider beam gets everything aligned.
+        result, calls = self._run(
+            lambda jobs, beam: jobs if beam else jobs[:3])
+        self.assertTrue(result.exists())
+        self.assertEqual(calls[0][1], None)      # first pass: default beam
+        self.assertEqual(calls[1][1], 100)       # retry: widened
+        self.assertEqual(len(calls), 2)
+
+    def test_escalates_to_single_job_if_the_wider_beam_is_not_enough(self):
+        result, calls = self._run(
+            lambda jobs, beam: jobs if beam and len(jobs) else jobs[:3],
+            n_jobs=10)
+        # tiers are (num_jobs as configured, beam), then (1, beam)
+        self.assertEqual(calls[0], (2, None))
+        self.assertEqual(calls[1], (2, 100))
+        self.assertTrue(result.exists())
+
+    def test_raises_with_a_useful_message_when_almost_nothing_aligns(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(lambda jobs, beam: jobs[:2], n_jobs=29)
+        msg = str(ctx.exception)
+        self.assertIn("2/29", msg)
+        # The message should point at the real cause rather than blaming MFA.
+        self.assertIn("transcript", msg.lower())
+
+    def test_missing_segment_does_not_shift_later_timings(self):
+        """The gap must not drift the rest of the chapter.
+
+        Offsets come from each segment's PLANNED duration, so a segment
+        with no alignment still advances the clock by its own length.
+        """
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work_dir = root / "work"
+        work_dir.mkdir()
+        jobs = [self._job(work_dir, i) for i in range(3)]
+        align_dir = root / "align"
+        align_dir.mkdir()
+        # Segment 1 (the middle one) produced no alignment.
+        for j in (jobs[0], jobs[2]):
+            words = Path(j.txt).read_text(encoding="utf-8").split()
+            (align_dir / f"{Path(j.wav).stem}.TextGrid").write_text(
+                fake_textgrid(words), encoding="utf-8")
+
+        results = postprocess(align_dir, [Pair(work_dir / "a.mp3", "T", "x")],
+                              jobs, log=lambda m: None)
+        words = results[0]["words"]
+        self.assertTrue(words)
+        # Third segment's words must start at/after 2.0s (two 1.0s segments
+        # before it), NOT at 1.0s as they would if the gap were collapsed.
+        self.assertGreaterEqual(max(w["start"] for w in words), 2.0)
+        # And the chapter's duration still counts the missing segment.
+        self.assertAlmostEqual(results[0]["duration"], 3.0, places=6)
 
 
 if __name__ == "__main__":

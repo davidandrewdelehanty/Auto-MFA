@@ -12,30 +12,70 @@ terminal. This split is deliberate — see *Why a script generator* below.
 
 ## Why a script generator
 
-Running MFA natively on Windows was tried first and is a dead end for this
-workload:
+MFA wraps Kaldi, which is developed and tested on Linux. On native Windows it
+is meaningfully slower: Kaldi spawns many short-lived subprocesses per job,
+Windows has no `fork()` so each pays full `CreateProcess` overhead, and
+Defender real-time-scans freshly extracted unsigned binaries.
 
-- **It's slow.** MFA wraps Kaldi, which spawns many short-lived subprocesses
-  per job. Windows has no `fork()`, so each one pays full `CreateProcess`
-  overhead, and Defender real-time-scans freshly extracted unsigned binaries.
-- **It silently loses data.** MFA repeatedly reported a fully successful run
-  ("Finished exporting TextGrids!", "Done!") while writing only 5 of 29
-  expected TextGrid files, with no error anywhere in its own log — at *every*
-  `--num_jobs` setting, including 1, which rules out a parallel-export race.
-  The likely cause is Windows' `spawn`-based multiprocessing (a classic source
-  of silent subprocess failures that `fork()`-based Linux never hits).
-
-Running the whole GUI under WSL instead fixes MFA but breaks the UI: under
+Running the whole GUI under WSL instead fixes that but breaks the UI: under
 WSLg, Tk sees only a **single** system font, so Cyrillic filenames and chapter
 titles — and even this app's own UI symbols — render as literal `\uXXXX`
 escapes. Locale settings, `FONTCONFIG_PATH`, installing font packages, and
 plain Ubuntu's own `python3-tk` all failed to resolve it.
 
-Generating a script sidesteps both problems: the GUI stays native Windows,
+Generating a script gets both halves right: the GUI stays native Windows,
 where Tk has real fonts and Cyrillic displays correctly, and the alignment
-runs in Linux, where MFA is fast and correct. `run_pipeline`'s
-verify-and-retry safety net (`--num_jobs 1`, then `--disable_mp`) is still in
-place, but should never need to fire on Linux.
+runs in Linux, MFA's own primary platform.
+
+### The silent-missing-output failure (read this before debugging one)
+
+For a long time this app reported errors like *"MFA reported success but 24/29
+expected TextGrid files are missing"*, and that was misdiagnosed twice — first
+as a parallel-export race, then as a Windows `spawn`-multiprocessing bug. Both
+were wrong. The same 5-of-29 result reproduced on Linux, at every `--num_jobs`
+including 1, which rules out anything to do with parallelism.
+
+**What's actually happening:** an utterance MFA cannot align produces *no
+output file at all*, and MFA still reports the run as fully successful. So
+"fewer files than expected" is not a bug in MFA's exporter — it is MFA's
+normal way of telling you that alignment failed for those utterances.
+
+The dominant cause is **out-of-vocabulary words with no pronunciation**.
+Russian audiobooks are dense with them (character names in every grammatical
+case, French phrases, years), and those names *recur constantly* — so leaving
+them unpronounceable doesn't lose a word here and there, it strips the
+alignment of its most frequent anchors and takes out whole segments. See
+*Dictionary handling* below for the fix.
+
+Secondary causes, once the dictionary is right: a transcript that genuinely
+doesn't match the audio (an FB2 preamble or endnotes section the narrator
+never reads, an abridged recording, a mis-paired chapter), or ordinary local
+divergence, which is why a small residue of unaligned segments is normal and
+tolerated rather than treated as failure.
+
+## Dictionary handling
+
+Before aligning, the pipeline builds a **book-specific dictionary**: the base
+`russian_mfa` dictionary plus g2p-generated pronunciations for every word in
+*this* corpus it doesn't already cover.
+
+```
+mfa g2p <corpus> russian_mfa oov.dict --dictionary_path russian_mfa
+cat russian_mfa.dict oov.dict > book.dict
+mfa align <corpus> book.dict russian_mfa <out>
+```
+
+The obvious-looking alternative — passing `--g2p_model_path` to `mfa align`
+and letting it handle OOV internally — is what this app used to do, and it is
+worse in two ways. MFA has shipped g2p models whose phone inventory doesn't
+match their own paired dictionary, so `align` refuses to run at all with
+`PronunciationG2PMismatchError`; and the natural fallback (dropping g2p) lands
+you in exactly the no-pronunciations state described above. Building the
+dictionary up front avoids both.
+
+If g2p is unavailable or fails, the run continues with the plain base
+dictionary and says so — a degraded run beats no run — but expect segments
+containing names to fail.
 
 ## How it works
 
@@ -228,13 +268,18 @@ python app/main.py --worker align /path/to/align_<slug>.job.json
   too fragmented on very clean, pause-heavy narration.
 - **Parallel jobs**: MFA workers to run concurrently (default 2). Raise it on
   a machine with more CPU cores/RAM to speed up alignment; lower it to 1 if
-  you hit memory pressure even with short utterances. The silent-output-loss
-  bug that forced this to 1 was Windows-only; the pipeline still verifies its
-  own output and retries (`--num_jobs 1`, then `--disable_mp`) if it ever
-  reappears.
-- **Out-of-dictionary words**: MFA auto-uses the Russian g2p model to cover
-  words missing from the dictionary. Numbers and punctuation are stripped from
-  the transcript before alignment.
+  you hit memory pressure. Note that peak memory is driven by the length of
+  the *longest single utterance*, not by job count or corpus size — which is
+  why every chapter is split into ~30s pieces regardless of size.
+- **Unaligned segments**: a few are normal. The pipeline retries with a wider
+  beam (`--beam 100 --retry_beam 400`, MFA's documented remedy), then
+  single-job, and only fails the run if under 90% of segments aligned — at
+  which point the problem is the transcript, not the beam. Segments that
+  never align leave a gap; because offsets come from each segment's *planned*
+  duration, that gap does not shift anything after it.
+- **Out-of-dictionary words**: covered by the book-specific dictionary built
+  before alignment (see *Dictionary handling*). Numbers and punctuation are
+  stripped from the transcript before alignment.
 - **Unpaired audio** is skipped; you are asked to confirm before generating.
 - **Re-running a script is safe** — `align_<slug>.sh` and its job file stay in
   the output folder, so you can re-run a book without touching the GUI, and

@@ -149,10 +149,19 @@ conda env remove -p ~/miniconda3/envs/auto-mfa -y
 bash /mnt/c/Users/david/projects/Auto-MFA/setup_wsl.sh
 ```
 
-**"MFA did not produce N/N expected TextGrid files"**
-This is the Windows bug that shouldn't happen on Linux. If it does appear,
-send the log — it means something new. The pipeline already retries twice
-(`--num_jobs 1`, then `--disable_mp`) before giving this up.
+**"Only N/M segments aligned … too low to produce usable timings"**
+Segments MFA can't align produce no output, and it reports success anyway.
+The pipeline already retried with a wider beam. At this point the cause is
+almost always the transcript not matching the audio:
+
+- the FB2 has a section the narrator doesn't read (translator's preface,
+  ПРИМЕЧАНИЯ / endnotes, a publisher's blurb) — pair around it, or use a
+  cleaner FB2
+- the recording is abridged, or a different edition from the text
+- a chapter is paired to the wrong audio file — check the **Pairs** box
+
+A handful of unaligned segments is normal and won't fail the run; it just
+logs a note and leaves a small gap.
 
 **Alignment looks shifted/wrong in the app**
 Check the run's log for `alignment re-sync` warnings — those mean MFA failed
