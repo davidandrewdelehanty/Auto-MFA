@@ -142,11 +142,24 @@ class AutoMfaApp(tk.Tk):
         log_frame.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(log_frame, height=10, state="disabled", wrap="word")
+        # Left in "normal" state permanently (never toggled to "disabled")
+        # so mouse selection and Ctrl+C always work like any ordinary text
+        # box; a <Key> binding blocks actual edits instead, which is a more
+        # reliable way to get a read-only-but-selectable log than relying on
+        # Tk's disabled-state selection behavior (inconsistent across
+        # platforms/Tk builds).
+        self.log_text = tk.Text(log_frame, height=10, wrap="word", cursor="xterm")
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_sb = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         log_sb.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_sb.set)
+        self.log_text.bind("<Key>", self._log_key_guard)
+        log_btns = ttk.Frame(log_frame)
+        log_btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        ttk.Button(log_btns, text="Select all", command=self._select_all_log).pack(
+            side="right", padx=(4, 0))
+        ttk.Button(log_btns, text="Copy log", command=self._copy_log).pack(
+            side="right")
         root.rowconfigure(6, weight=3)
 
     def _make_listbox(self, parent: ttk.Frame, label: str, col: int,
@@ -381,6 +394,26 @@ class AutoMfaApp(tk.Tk):
                 return candidate
         return None
 
+    def _base_env(self) -> dict:
+        """Env vars every worker invocation needs, regardless of how it is
+        launched.
+
+        PYTHONUTF8 forces Python's UTF-8 mode, which is what decides the
+        *default* text encoding used by `open()` calls that don't pass their
+        own `encoding=` -- including ones deep inside MFA/kalpy that we don't
+        control. Without it, Windows falls back to the system locale codepage
+        (commonly cp1252), and writing/reading the Cyrillic corpus text
+        crashes with "'charmap' codec can't encode characters...". This has
+        to be an env var (not e.g. a `-X utf8` flag) because MFA spawns its
+        own worker subprocesses for parallel jobs, and only env vars survive
+        that re-exec automatically. PYTHONIOENCODING is set too as a
+        belt-and-suspenders for stdio specifically.
+        """
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
+
     def _runtime_env(self, runtime_python):
         """Return an env dict with the runtime's bin dirs on PATH, so DLLs
         (kaldi, ffmpeg, MKL...) are found even though the env is not activated.
@@ -392,7 +425,7 @@ class AutoMfaApp(tk.Tk):
             runtime / "Scripts",
             runtime,
         ]
-        env = os.environ.copy()
+        env = self._base_env()
         existing = env.get("PATH", "")
         prefix = os.pathsep.join(str(d) for d in bin_dirs)
         env["PATH"] = prefix + os.pathsep + existing
@@ -406,11 +439,11 @@ class AutoMfaApp(tk.Tk):
                 self._runtime_env(runtime_py),
             )
         if getattr(sys, "frozen", False):
-            return [sys.executable, "--worker", *args], None
+            return [sys.executable, "--worker", *args], self._base_env()
         # Source mode: invoke main.py as a script (it bootstraps the project
         # root onto sys.path itself), so cwd does not matter.
         script = Path(__file__).resolve().parent / "main.py"
-        return [sys.executable, str(script), "--worker", *args], None
+        return [sys.executable, str(script), "--worker", *args], self._base_env()
 
     def _start_worker(self, args: list[str]) -> None:
         cmd, extra_env = self._worker_command(args)
@@ -500,14 +533,49 @@ class AutoMfaApp(tk.Tk):
 
     # ------------------------------------------------------------ logging
     def log(self, msg: str) -> None:
-        self.log_text.configure(state="normal")
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+
+    def _log_key_guard(self, event: "tk.Event") -> "str | None":
+        """Block typing/edits in the log box while leaving selection, Ctrl+C
+        copy, and navigation (arrows/Home/End/Page Up/Down) working.
+        """
+        allowed_keysyms = {
+            "Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End",
+            "Shift_L", "Shift_R", "Control_L", "Control_R",
+        }
+        ctrl_down = bool(event.state & 0x4)
+        if ctrl_down and event.keysym.lower() in ("c", "a", "insert"):
+            if event.keysym.lower() == "a":
+                self._select_all_log()
+                return "break"
+            return None  # let Ctrl+C / Ctrl+Insert copy proceed normally
+        if event.keysym in allowed_keysyms:
+            return None
+        return "break"
+
+    def _select_all_log(self) -> None:
+        self.log_text.tag_add("sel", "1.0", "end")
+        self.log_text.mark_set("insert", "end")
+        self.log_text.see("insert")
+
+    def _copy_log(self) -> None:
+        text = self.log_text.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(text)
 
 
 def launch() -> None:
-    style = ttk.Style()
+    # Create the real root window FIRST. ttk.Style() with no widget passed
+    # in looks for an existing Tk root and, if none exists yet, silently
+    # creates one itself (Tkinter's "implicit default root" behavior) --
+    # that phantom root is a second, empty window that never gets any
+    # widgets or a title, which is exactly the blank window some users see
+    # alongside the real app window on every launch. Building AutoMfaApp
+    # (a tk.Tk subclass) first, then passing it explicitly to Style(),
+    # avoids ever creating that phantom root.
+    app = AutoMfaApp()
+    style = ttk.Style(app)
     if "vista" in style.theme_names():
         style.theme_use("vista")
     try:
@@ -532,5 +600,4 @@ def launch() -> None:
         )
     except tk.TclError:
         pass
-    app = AutoMfaApp()
     app.mainloop()
