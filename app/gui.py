@@ -31,7 +31,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .fb2 import extract_chapters, find_audio_files, find_fb2, transcript_words
-from .scriptgen import build_script, run_command_for, slugify, to_wsl_path
+from .scriptgen import (build_script, build_upload_script, run_command_for,
+                        slugify, to_wsl_path)
 
 WSL_INSTALL_URL = "https://learn.microsoft.com/en-us/windows/wsl/install"
 
@@ -154,7 +155,7 @@ class AutoMfaApp(tk.Tk):
         ttk.Label(
             gov,
             text=("Files are written as <slug>-ch01.json … ; R2 folder builds "
-                  "each audio_url (leave blank to fill in later)."),
+                  "each audio_url and is where 'Upload script' sends the audio."),
             foreground="#555555",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 0))
 
@@ -201,6 +202,9 @@ class AutoMfaApp(tk.Tk):
             btns, text="Copy run command", command=self._copy_command,
             state="disabled")
         self.btn_copy_cmd.pack(side="right", padx=(0, 6))
+        self.btn_upload = ttk.Button(
+            btns, text="Generate upload script", command=self._generate_upload)
+        self.btn_upload.pack(side="left")
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=4)
         log_frame.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
@@ -490,6 +494,77 @@ class AutoMfaApp(tk.Tk):
             f"Run it in an Ubuntu (WSL) terminal:\n\n{self._run_command}\n\n"
             "(the run command is on your clipboard)")
         self._copy_command()
+
+    def _generate_upload(self) -> None:
+        """Write a script that uploads this book's audio files to R2.
+
+        Uploads only the audio actually paired -- the book folder also
+        holds the FB2, the generated scripts and the output JSONs, none of
+        which belong in the audio bucket.
+        """
+        folder = self.r2_folder.get().strip().strip("/")
+        if not folder:
+            messagebox.showerror(
+                "R2 folder required",
+                "Enter the R2 folder to upload into (e.g. 'dama').\n\n"
+                "It is the same folder used to build each audio_url, so the "
+                "uploaded audio and the JSONs stay in agreement.")
+            return
+
+        # Prefer the paired files; fall back to everything found in the
+        # folder if nothing is paired yet, so the uploader is still usable
+        # on its own for a book whose alignment is already done.
+        if self.pairs:
+            audio = [self.audio_files[a] for a, _ in self.pairs]
+        else:
+            audio = list(self.audio_files)
+        if not audio:
+            messagebox.showinfo("Nothing to upload",
+                                "Load a book folder with audio files first.")
+            return
+
+        book_dir = Path(self.book_folder.get())
+        dest = Path(self.output_folder.get() or self.book_folder.get())
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            list_path = dest / f"upload_{folder}.files.txt"
+            script_path = dest / f"upload_{folder}.sh"
+            # rclone --files-from takes paths relative to the source root.
+            # LF-terminated and UTF-8: these names are routinely Cyrillic.
+            list_path.write_text(
+                "".join(f"{p.name}\n" for p in audio),
+                encoding="utf-8", newline="\n")
+            script_path.write_text(
+                build_upload_script(
+                    r2_folder=folder,
+                    source_dir_wsl=to_wsl_path(book_dir),
+                    list_path_wsl=to_wsl_path(list_path),
+                    version=__version__,
+                ),
+                encoding="utf-8", newline="\n")
+        except OSError as exc:
+            messagebox.showerror("Could not write upload script", str(exc))
+            return
+
+        command = run_command_for(to_wsl_path(script_path))
+        self._run_command = command
+        self.btn_copy_cmd.configure(state="normal")
+        self.clipboard_clear()
+        self.clipboard_append(command)
+
+        self.log("---")
+        self.log(f"Wrote {script_path.name} ({len(audio)} audio file(s) "
+                 f"-> {folder}/)")
+        self.log("Run this in an Ubuntu (WSL) terminal:")
+        self.log(f"    {command}")
+        messagebox.showinfo(
+            "Upload script ready",
+            f"Wrote:\n{script_path}\n\n"
+            f"{len(audio)} audio file(s) will go to {folder}/\n\n"
+            f"Run it in an Ubuntu (WSL) terminal:\n\n{command}\n\n"
+            "(copied to your clipboard)\n\n"
+            "It needs rclone with an 'r2' remote configured; the script "
+            "prints the exact setup command if it isn't.")
 
     def _copy_command(self) -> None:
         if not self._run_command:

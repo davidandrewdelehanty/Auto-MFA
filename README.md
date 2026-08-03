@@ -266,4 +266,19 @@ Auto-MFA.spec    PyInstaller spec (GUI shell)
 build.ps1        Windows build; use -SkipRuntime (the GUI needs only tkinter)
 setup_wsl.sh     WSL/Linux setup: creates the conda env with MFA in it
 align_<slug>.sh  generated per book by the GUI; what you actually run
+upload_<f>.sh    generated per book; rclone-uploads the audio to R2
 ```
+
+## Uploading audio to R2
+
+**Generate upload script** writes `upload_<folder>.sh` plus a file list, and
+`rclone copy`s exactly the paired audio files into
+`govorim-audio/<R2 folder>/` — the same folder the JSONs' `audio_url` fields
+point at, so the two can't drift apart. Only the listed audio is uploaded;
+the FB2, generated scripts and output JSONs in the same folder are not.
+
+No credentials are written into the generated script — it sits in a book
+folder that gets copied around, so a leaked key there would be a real
+problem. It expects an rclone remote (default name `r2`, overridable via
+`AUTO_MFA_R2_REMOTE`) configured once on the machine, and prints the exact
+`rclone config create` command, endpoint included, if it's missing.

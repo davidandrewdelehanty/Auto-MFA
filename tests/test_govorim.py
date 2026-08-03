@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import govorim
 from app.pipeline import CorpusJob, Pair, run_pipeline, write_govorim
-from app.scriptgen import (build_script, run_command_for, shell_quote,
-                           slugify, to_wsl_path)
+from app.scriptgen import (build_script, build_upload_script, run_command_for,
+                           shell_quote, slugify, to_wsl_path)
 
 
 def aligned(*pairs):
@@ -328,6 +328,54 @@ class RunCommandTest(unittest.TestCase):
         script = build_script("mh", "/mnt/c/marble head/align_mh.job.json",
                               "/mnt/c/p", "2.0.1")
         self.assertIn("bash '/mnt/c/marble head/align_mh.sh'", script)
+
+
+class UploadScriptTest(unittest.TestCase):
+    def _script(self, **kw):
+        params = dict(r2_folder="dama",
+                      source_dir_wsl="/mnt/c/books/marble head",
+                      list_path_wsl="/mnt/c/books/marble head/upload_dama.files.txt",
+                      version="2.1.0")
+        params.update(kw)
+        return build_upload_script(**params)
+
+    def test_never_embeds_credentials(self):
+        """The script sits in a book folder that gets copied around; a
+        leaked secret there is far worse than one extra setup step."""
+        script = self._script()
+        # The real key/secret must not appear, and no assignment of one either.
+        self.assertNotIn("cc9d35405aadb9bc061516a40b0ff69b", script)
+        self.assertNotIn("05e879c107847e543a4f3363b73b3de4179c8cb9420df96e0cd4ace05ba9ff5b", script)
+        self.assertIn("YOUR_ACCESS_KEY_ID", script)
+        self.assertIn("YOUR_SECRET_ACCESS_KEY", script)
+
+    def test_uploads_only_the_listed_files(self):
+        # A book folder also holds the FB2, generated scripts and output
+        # JSONs -- none of which belong in the audio bucket.
+        script = self._script()
+        self.assertIn("--files-from", script)
+        self.assertIn("rclone copy", script)
+
+    def test_targets_the_same_folder_used_for_audio_url(self):
+        script = self._script(r2_folder="marble-head")
+        self.assertIn("FOLDER='marble-head'", script)
+        self.assertIn("govorim-audio", script)
+
+    def test_quotes_paths_with_spaces(self):
+        script = self._script()
+        self.assertIn("SRC='/mnt/c/books/marble head'", script)
+        self.assertIn("LIST='/mnt/c/books/marble head/upload_dama.files.txt'",
+                      script)
+
+    def test_fails_loudly_when_rclone_or_remote_missing(self):
+        script = self._script()
+        self.assertIn("command -v rclone", script)
+        self.assertIn("rclone listremotes", script)
+        self.assertIn("rclone config create", script)
+
+    def test_remote_name_is_overridable(self):
+        script = self._script()
+        self.assertIn("AUTO_MFA_R2_REMOTE", script)
 
 
 if __name__ == "__main__":

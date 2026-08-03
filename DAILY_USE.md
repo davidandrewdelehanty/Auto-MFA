@@ -73,6 +73,43 @@ output folder.
 
 ---
 
+## Uploading the audio to R2
+
+Only needed if this book's audio isn't in the `govorim-audio` bucket yet.
+Do it from the same GUI screen — it uses the **R2 folder** field, so the
+uploaded audio lands exactly where the JSONs' `audio_url` fields point.
+
+1. Press **Generate upload script**.
+2. Paste the command into Ubuntu:
+
+```bash
+# WSL
+bash '/mnt/c/Users/david/.../upload_<folder>.sh'
+```
+
+It uploads only the audio files (not the FB2, scripts, or JSONs), shows a
+progress bar, and lists the bucket contents when done. Re-running is safe —
+files already uploaded are skipped.
+
+**First time only**, it will tell you to set up rclone. Install it and create
+the remote:
+
+```bash
+# WSL
+sudo apt-get install -y rclone
+rclone config create r2 s3 provider=Cloudflare \
+    access_key_id=YOUR_ACCESS_KEY_ID \
+    secret_access_key=YOUR_SECRET_ACCESS_KEY \
+    endpoint=https://34e5181838c8f719758264dbb7b02b46.r2.cloudflarestorage.com \
+    region=auto
+```
+
+Your keys are in the Cloudflare dashboard under **R2 → Manage API tokens**.
+They're stored once in rclone's own config — deliberately never written into
+the generated scripts, since those sit in book folders that get copied around.
+
+---
+
 ## Getting the JSONs into Govorim
 
 Copy them into the repo, then commit:
@@ -88,8 +125,8 @@ git push
 
 Vercel picks up the push automatically; the deploy usually takes 1–2 minutes.
 
-If the audio wasn't on R2 yet when you generated (you left **R2 folder**
-blank), upload it and fix the `audio_url` fields before committing.
+If you left **R2 folder** blank when generating, the `audio_url` fields are
+bare filenames — fill them in before committing.
 
 ---
 
@@ -122,6 +159,10 @@ Check the run's log for `alignment re-sync` warnings — those mean MFA failed
 to align some words, and the surrounding timings may drift. Usually caused by
 the FB2 text not matching what's actually read aloud (a LibriVox preamble, an
 endnotes section, a different edition).
+
+**"No rclone remote named 'r2' is configured"**
+Run the `rclone config create` command in *Uploading the audio to R2* above.
+The script prints it too, with your endpoint already filled in.
 
 **Wrong chapters aligned**
 The FB2's chapter list is what the GUI shows. If it doesn't match the audio
