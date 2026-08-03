@@ -32,6 +32,31 @@ $runtimeDest = Join-Path $dist "runtime"
 
 function Write-Step($msg) { Write-Host "`n=== $msg" -ForegroundColor Cyan }
 
+function Expand-Runtime([string]$TarPath, [string]$Dest) {
+    Write-Step "Extracting runtime into $Dest"
+    New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    tar -xzf $TarPath -C $Dest
+    if ($LASTEXITCODE -ne 0) { throw "tar extract failed" }
+}
+
+# Refresh the `app` package inside the runtime from the source tree.
+#
+# This matters more than it looks: the GUI shell exe does NOT run the
+# alignment itself -- it spawns `runtime\python.exe -m app.main --worker ...`,
+# so the code that actually does the work is the copy at
+# runtime\Lib\site-packages\app, NOT the copy frozen into the exe. A runtime
+# restored from an older runtime.tar.gz therefore carries whatever app code
+# was current when that tarball was packed. Re-syncing on every build keeps
+# the two halves from silently drifting apart (and makes editing Python code
+# + re-running with -SkipGui -SkipRuntime a fast iteration loop).
+function Sync-AppIntoRuntime([string]$RuntimeRoot) {
+    if (-not (Test-Path (Join-Path $RuntimeRoot "python.exe"))) { return }
+    $sp = Join-Path $RuntimeRoot "Lib\site-packages\app"
+    Remove-Item -Recurse -Force $sp -ErrorAction SilentlyContinue
+    Copy-Item -Recurse (Join-Path $root "app") $sp
+    Write-Host "Synced app package into runtime." -ForegroundColor Green
+}
+
 # ---------------------------------------------------------------- GUI shell
 if (-not $SkipGui) {
     Write-Step "Building GUI shell ($dist\Auto-MFA.exe)"
@@ -223,10 +248,7 @@ if (-not $SkipRuntime) {
     & (Join-Path $mini "Scripts\conda-pack.exe") -p $runtimeEnv -o $pack -f
     if ($LASTEXITCODE -ne 0) { throw "conda-pack failed" }
 
-    Write-Step "Extracting runtime into $runtimeDest"
-    New-Item -ItemType Directory -Force -Path $runtimeDest | Out-Null
-    tar -xzf $pack -C $runtimeDest
-    if ($LASTEXITCODE -ne 0) { throw "tar extract failed" }
+    Expand-Runtime $pack $runtimeDest
 
     # ---- verify ------------------------------------------------------------
     # Invoking python.exe directly here (not through conda's own activate.bat)
@@ -264,6 +286,35 @@ if (-not $SkipRuntime) {
         $env:PATH = $prevPath
     }
 }
+
+# ------------------------------------------------- reconcile dist\ contents
+# PyInstaller's COLLECT step DELETES the whole dist\Auto-MFA output folder on
+# every GUI build (that's what --noconfirm agrees to). The conda-packed MFA
+# runtime lives at dist\Auto-MFA\runtime -- i.e. inside that same folder --
+# so building the GUI shell silently destroys the runtime, and the app then
+# fails at BEGIN with "No module named montreal_forced_aligner" (the exe
+# falls back to running ITSELF as the worker, and the frozen exe deliberately
+# excludes MFA). Rebuilding the 655 MB runtime from scratch just to undo that
+# would be absurd, so restore it from the tarball we already have instead.
+#
+# This runs unconditionally, whatever flags were passed, which also makes
+# `.\build.ps1 -SkipGui -SkipRuntime` a fast "repair dist\ and refresh the
+# app code" command.
+$runtimePyExe = Join-Path $runtimeDest "python.exe"
+if (-not (Test-Path $runtimePyExe)) {
+    $packedRuntime = Join-Path $build "runtime.tar.gz"
+    if (Test-Path $packedRuntime) {
+        Write-Step "Runtime is missing from dist (a GUI build wipes it) -- restoring"
+        Expand-Runtime $packedRuntime $runtimeDest
+    }
+}
+if (-not (Test-Path $runtimePyExe)) {
+    throw ("No MFA runtime at '$runtimeDest' and no build\runtime.tar.gz to restore " +
+        "from. Re-run this script without -SkipRuntime to build it (large download).")
+}
+
+# Always ship current app code inside the runtime -- see Sync-AppIntoRuntime.
+Sync-AppIntoRuntime $runtimeDest
 
 Write-Step "Done"
 Write-Host "App:     $dist\Auto-MFA.exe" -ForegroundColor Green
