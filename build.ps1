@@ -231,7 +231,22 @@ if (-not $SkipGui) {
 }
 
 # ------------------------------------------------------------ MFA runtime
+#
+# Wrapped in try/catch: if a GUI rebuild ran first (no -SkipGui), PyInstaller
+# already deleted dist\Auto-MFA -- including dist\Auto-MFA\runtime -- as part
+# of wiping that whole folder. Everything below re-populates it, but if ANY
+# step in here throws (conda hiccup, a transient verify failure, network
+# blip during conda-pack...), $ErrorActionPreference = "Stop" would abort the
+# entire script right here, well before the "reconcile dist\ contents"
+# section at the bottom ever runs -- the one section whose whole job is to
+# restore the runtime from build\runtime.tar.gz if it's missing. The result:
+# a single failed step here silently leaves dist\Auto-MFA\runtime completely
+# absent, and the app falls back to running itself as its own worker (which
+# has no MFA at all) with a confusing unrelated-looking error. Catch and warn
+# instead, so a mid-rebuild hiccup still falls through to "restore the last
+# known-good runtime" rather than leaving nothing there at all.
 if (-not $SkipRuntime) {
+try {
     # ---- ensure conda ----------------------------------------------------
     if (-not (Test-Path $condaExe)) {
         if ($NoConda) { throw "conda not found and -NoConda was given." }
@@ -328,6 +343,13 @@ if (-not $SkipRuntime) {
         $ErrorActionPreference = $prevEAP
         $env:PATH = $prevPath
     }
+} catch {
+    Write-Warning "Runtime (re)build failed: $($_.Exception.Message)"
+    Write-Warning ("Falling back to the last successfully built runtime " +
+        "(build\runtime.tar.gz) below, if one exists. Re-run without " +
+        "-SkipGui and -SkipRuntime once the above is fixed to actually " +
+        "rebuild it.")
+}
 }
 
 # ------------------------------------------------- reconcile dist\ contents
