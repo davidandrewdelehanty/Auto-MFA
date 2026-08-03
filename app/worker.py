@@ -14,12 +14,47 @@ All other lines (MFA / ffmpeg output) are passed through untouched.
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import List
 
 from . import segment as segment_mod
 from .pipeline import Pair, ensure_models, model_present, run_pipeline
+
+
+def _suppress_child_console_windows() -> None:
+    """On Windows, make every subprocess.Popen created from here on run
+    without its own console window.
+
+    This process (spawned by the GUI as `pythonw.exe`, no console of its
+    own) runs MFA in-process, but MFA/kalpy internally launch many short-
+    lived subprocess.Popen calls of their own -- kaldi utility binaries,
+    one or more per parallel job, repeated at every alignment stage. A
+    console-subsystem child inherits the parent's console if it has one;
+    since this process has none, Windows allocates a brand-new console
+    window for each child instead, which is exactly the "ghost prompts pop
+    up and disappear" flicker some users see when alignment starts. We
+    don't control MFA's own subprocess calls, so instead we patch
+    subprocess.Popen itself to always OR in CREATE_NO_WINDOW -- this
+    applies to every caller in this process (including ones we don't own),
+    regardless of when they imported the `subprocess` module, since Python
+    looks up `subprocess.Popen` fresh on every call.
+    """
+    if sys.platform != "win32":
+        return
+    _original_init = subprocess.Popen.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        )
+        return _original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _patched_init
+
+
+_suppress_child_console_windows()
 
 
 def _ensure_stdout() -> None:

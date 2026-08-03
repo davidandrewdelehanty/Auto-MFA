@@ -230,7 +230,7 @@ def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
                   dictionary: str, acoustic: str, log: LogFn,
                   num_jobs: int = 2) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    args = [
+    base_args = [
         "align",
         str(corpus_dir),
         dictionary,
@@ -242,14 +242,30 @@ def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
         "--single_speaker",   # one narrator; also disables speaker adaptation
         "--num_jobs", str(max(1, num_jobs)),
     ]
-    if model_present("g2p", dictionary):
-        # Cover words missing from the base dictionary (names, foreign
-        # phrases, ...) instead of leaving them unaligned. See ensure_models.
-        args += ["--g2p_model_path", dictionary]
-    else:
+    use_g2p = model_present("g2p", dictionary)
+    if not use_g2p:
         log("Note: no g2p model available for this dictionary; words "
             "missing from it will not align.")
-    invoke_mfa(args, log)
+    args = base_args + (["--g2p_model_path", dictionary] if use_g2p else [])
+    try:
+        invoke_mfa(args, log)
+    except Exception as exc:
+        # MFA's pretrained model server has, at times, served a g2p model
+        # whose phone inventory doesn't match its paired dictionary's (a
+        # versioning issue on MFA's end, not something this app can fix by
+        # re-downloading). MFA refuses to align AT ALL when that happens,
+        # even though the mismatch only affects out-of-dictionary words.
+        # g2p coverage is already documented as best-effort elsewhere (see
+        # ensure_models: a failed g2p *download* doesn't block alignment) --
+        # apply the same fallback here: drop g2p and retry once, rather than
+        # failing the whole run over words g2p would have covered anyway.
+        if use_g2p and "PronunciationG2PMismatchError" in str(exc):
+            log(f"Warning: the downloaded g2p model is incompatible with "
+                f"this dictionary ({exc}). Retrying without g2p -- words "
+                f"missing from the dictionary will not align.")
+            invoke_mfa(base_args, log)
+        else:
+            raise
 
 
 def _shift(tiers: Dict[str, List[Dict]], offset: float) -> Dict[str, List[Dict]]:
