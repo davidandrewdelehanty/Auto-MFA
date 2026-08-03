@@ -73,13 +73,33 @@ if [ ! -x "$ENV_DIR/bin/python" ]; then
     # `tk` is listed explicitly so tkinter is guaranteed to work -- don't
     # rely on it coming along for free with `python`, the same mistake that
     # caused the "no module named tkinter" issue on the Windows build.
+    # `openfst`/`pynini` are listed explicitly too: they're transitive deps
+    # of montreal-forced-aligner (needed for the g2p step's `fstcompile` and
+    # friends), but a partial/interrupted create can leave them out of a
+    # from-scratch solve, and there's no cheap way to detect that after the
+    # fact -- pinning them here makes a fresh create fail loudly instead.
     "$CONDA" create -p "$ENV_DIR" -y --override-channels -c conda-forge \
-        "python=3.11" tk montreal-forced-aligner "kaldi=*=cpu*" ffmpeg
+        "python=3.11" tk montreal-forced-aligner "kaldi=*=cpu*" openfst pynini ffmpeg
 fi
 
 step "Verifying tkinter and MFA both import cleanly"
+# Not all MFA releases expose a __version__ attribute, so don't depend on
+# it -- a clean import of all three modules is all we actually need here.
 "$ENV_DIR/bin/python" -c \
-    "import tkinter, montreal_forced_aligner, kalpy; print('ok:', montreal_forced_aligner.__version__)"
+    "import tkinter, montreal_forced_aligner, kalpy; print('ok: tkinter + montreal_forced_aligner + kalpy import cleanly')"
+
+step "Verifying openfst CLI tools are on the env's PATH"
+# fstcompile etc. are compiled binaries, not Python-importable, so the check
+# above wouldn't have caught them being missing -- MFA's g2p step needs them
+# directly on PATH at runtime.
+if [ ! -x "$ENV_DIR/bin/fstcompile" ]; then
+    echo "ERROR: $ENV_DIR/bin/fstcompile not found -- the openfst package"
+    echo "didn't install correctly. Try:"
+    echo "  $CONDA env remove -p $ENV_DIR -y"
+    echo "  bash setup_wsl.sh"
+    exit 1
+fi
+echo "ok: fstcompile found at $ENV_DIR/bin/fstcompile"
 
 launcher="$ROOT/run.sh"
 cat > "$launcher" <<EOF
