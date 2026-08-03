@@ -496,6 +496,11 @@ def write_zip(results: List[Dict], output_dir: Path, zip_path: Path,
     return zip_path
 
 
+def _missing_textgrids(alignment_dir: Path, jobs: List[CorpusJob]) -> List[CorpusJob]:
+    return [j for j in jobs
+            if not (Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid").exists()]
+
+
 def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                  output_dir: Path,
                  zip_name: Optional[str] = None,
@@ -525,6 +530,36 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         progress(0.0, "aligning")
         run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
                      log, num_jobs=num_jobs)
+        # MFA has been observed, on Windows, to report a fully successful
+        # run ("Finished exporting TextGrids...!", "Done!") while its own
+        # parallel (--num_jobs > 1) export step silently drops most of the
+        # output -- e.g. 5 TextGrids written out of 29 expected, with no
+        # error or warning anywhere in its log. This looks like a
+        # Windows-specific race in MFA/Kaldi's own worker-pool
+        # coordination (far less exercised there than on Linux/Mac), not
+        # anything wrong with our corpus or arguments -- the alignment
+        # itself completes fine, only the final per-job export step loses
+        # work. Rather than fail the whole run over it, verify the expected
+        # output actually exists and, if some is missing, retry once with
+        # --num_jobs 1 (slower, but avoids whatever the parallel export
+        # path is racing on) before giving up for real.
+        missing = _missing_textgrids(alignment_dir, jobs)
+        if missing and num_jobs != 1:
+            log(f"Warning: MFA reported success but {len(missing)}/{len(jobs)} "
+                f"expected TextGrid files are missing (a known MFA issue with "
+                f"parallel export on Windows). Retrying alignment with "
+                f"--num_jobs 1 -- this will take longer.")
+            run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
+                         acoustic, log, num_jobs=1)
+            missing = _missing_textgrids(alignment_dir, jobs)
+        if missing:
+            raise RuntimeError(
+                f"MFA did not produce {len(missing)}/{len(jobs)} expected "
+                f"TextGrid files even after a --num_jobs 1 retry (first "
+                f"missing: {Path(missing[0].wav).stem}.TextGrid). This "
+                f"looks like a deeper MFA/corpus issue, not a transient "
+                f"parallel-export race."
+            )
         progress(0.9, "building JSON")
         results = postprocess(alignment_dir, pairs, jobs, log,
                               work_dir=work_dir, ffmpeg=ffmpeg)
