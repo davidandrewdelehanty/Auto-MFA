@@ -68,11 +68,20 @@ def mfa_data_dir() -> Path:
 
 
 def model_present(model_type: str, name: str) -> bool:
-    """Check whether an MFA pretrained model is already downloaded."""
+    """Check whether an MFA pretrained model is already downloaded.
+
+    MFA stores different model types under different filenames: acoustic
+    and g2p models are `<name>.zip`, but dictionaries are a plain-text
+    `<name>.dict` -- NOT a zip. Missing that extension meant this always
+    reported dictionaries as absent (even once downloaded), so every run
+    re-triggered a "Downloading dictionary model..." step that actually
+    just asked MFA to re-check something already on disk.
+    """
     base = mfa_data_dir() / "pretrained_models"
     if not base.is_dir():
         return False
     for candidate in (base / model_type / f"{name}.zip",
+                      base / model_type / f"{name}.dict",
                       base / model_type / name):
         if candidate.exists():
             return True
