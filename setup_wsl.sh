@@ -48,6 +48,20 @@ if [ -n "${WSL_DISTRO_NAME:-}" ]; then
     esac
 fi
 
+step "Ensuring a Cyrillic-capable system font is installed"
+# Tk's glyph rendering goes through the *system's* fontconfig, not the
+# conda env -- a minimal WSL/Ubuntu image can ship with essentially no
+# fonts installed at all, which makes Cyrillic text (routine here --
+# these are Russian audiobooks) render as boxes/garbled placeholder
+# glyphs no matter which font family the app asks for. Best-effort: safe
+# to skip if there's no apt-get (not Debian/Ubuntu) or no sudo access --
+# the app still runs either way, just with worse font rendering until a
+# Cyrillic-capable font is available some other way.
+if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y >/dev/null 2>&1 || true
+    sudo apt-get install -y fonts-dejavu-core fonts-noto-core >/dev/null 2>&1 || true
+fi
+
 if [ ! -x "$CONDA_DIR/bin/conda" ]; then
     step "Downloading Miniconda into $CONDA_DIR (one-time)"
     installer="$(mktemp /tmp/miniconda-XXXXXX.sh)"
