@@ -498,14 +498,27 @@ class AutoMfaApp(tk.Tk):
             self.log(line[len("@STATUS|"):])
         elif line.startswith("@PROGRESS|"):
             _, frac, msg = line.split("|", 2)
-            try:
-                self.progress["value"] = float(frac) * 100
-            except ValueError:
-                pass
+            if msg == "aligning":
+                # The actual `mfa align` run is one long synchronous call
+                # with no progress callback back into this app -- it can
+                # run for many minutes on a full chapter with nothing to
+                # report in between. A determinate bar frozen at 0% for
+                # that whole stretch reads as "hung", so switch to an
+                # animated indeterminate bar for just this phase: an
+                # honest "still working, no ETA available" signal instead
+                # of a number we can't actually back up.
+                self._set_progress_indeterminate(True)
+            else:
+                self._set_progress_indeterminate(False)
+                try:
+                    self.progress["value"] = float(frac) * 100
+                except ValueError:
+                    pass
             if msg:
                 self.log(msg)
         elif line.startswith("@DONE|"):
             self._done_received = True
+            self._set_progress_indeterminate(False)
             self.progress["value"] = 100
             result = line[len("@DONE|"):]
             self.log(f"Done: {result}")
@@ -513,12 +526,22 @@ class AutoMfaApp(tk.Tk):
             self._set_busy(False)
         elif line.startswith("@ERROR|"):
             self._done_received = True
+            self._set_progress_indeterminate(False)
             msg = line[len("@ERROR|"):]
             self.log(f"ERROR: {msg}")
             messagebox.showerror("Error", msg)
             self._set_busy(False)
         elif line.strip():
             self.log(line)
+
+    def _set_progress_indeterminate(self, on: bool) -> None:
+        currently_on = str(self.progress.cget("mode")) == "indeterminate"
+        if on and not currently_on:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(15)
+        elif not on and currently_on:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -527,6 +550,7 @@ class AutoMfaApp(tk.Tk):
         for widget in (self.btn_begin, self.btn_download):
             widget.configure(state=state)
         if busy:
+            self._set_progress_indeterminate(False)
             self.progress["value"] = 0
             self.log("---")
             self.log("Working…")
