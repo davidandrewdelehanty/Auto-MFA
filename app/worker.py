@@ -84,7 +84,8 @@ def cmd_align(args: List[str]) -> int:
     pairs = [
         Pair(Path(p["audio"]), p.get("title", ""), p["text"],
              sub_chapters=[tuple(sc) for sc in p["sub_chapters"]]
-             if p.get("sub_chapters") else None)
+             if p.get("sub_chapters") else None,
+             sub_texts=p.get("sub_texts") or None)
         for p in job["pairs"]
     ]
     if not pairs:
@@ -101,6 +102,8 @@ def cmd_align(args: List[str]) -> int:
             num_jobs=job.get("num_jobs", 2),
             target_seconds=job.get("target_seconds", segment_mod.DEFAULT_TARGET),
             max_seconds=job.get("max_seconds", segment_mod.DEFAULT_MAX),
+            govorim_slug=job.get("govorim_slug", ""),
+            r2_folder=job.get("r2_folder", ""),
             log=_status,
             progress=_progress,
         )

@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from . import audio as audio_mod
 from . import chunking
+from . import govorim
 from . import segment as segment_mod
 from .fb2 import transcript_words, words_to_text
 from .textgrid import parse_textgrid
@@ -37,6 +38,12 @@ class Pair:
     # back into one result (and one cut audio clip) per original chapter. None
     # for the ordinary one-file-per-chapter case.
     sub_chapters: Optional[List[Tuple[str, int]]] = None
+    # Parallel to sub_chapters: each constituent chapter's own ORIGINAL
+    # (un-normalized) text. Only needed for the Govorim output format, which
+    # reproduces real book text with its punctuation and so cannot work from
+    # the normalized transcript. Optional -- everything else in the pipeline
+    # works fine without it.
+    sub_texts: Optional[List[str]] = None
 
 
 @dataclass
@@ -378,6 +385,7 @@ def _split_pair_into_chapters(pair: Pair, pair_idx: int, words: List[Dict],
                 f"timings will still be produced).")
 
     base_stem = audio_mod.safe_stem(pair.audio.stem)
+    sub_texts = pair.sub_texts or []
     out: List[Dict] = []
     for k, (title, _wc) in enumerate(sub_chapters):
         w_slice = words[bounds[k]:bounds[k + 1]]
@@ -400,6 +408,10 @@ def _split_pair_into_chapters(pair: Pair, pair_idx: int, words: List[Dict],
             "duration": round(end_t - start_t, 6),
             "words": rebased_words,
             "phones": rebased_phones,
+            # Underscore-prefixed keys are internal: stripped before this
+            # dict is ever serialized (see write_zip). Carried so the
+            # Govorim writer can reproduce this chapter's real text.
+            "_source_text": sub_texts[k] if k < len(sub_texts) else "",
         }
         if raw_wav is not None:
             clip_path = Path(work_dir) / "chapters" / chapter_audio_name
@@ -474,6 +486,7 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
             "duration": round(duration, 6),
             "words": words,
             "phones": phones,
+            "_source_text": pair.text,   # internal; see write_zip
         }
         if len(tiers) > 2:
             result["tiers"] = {
@@ -482,6 +495,15 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
             }
         results.append(result)
     return results
+
+
+def _public_fields(result: Dict) -> Dict:
+    """Drop internal, underscore-prefixed bookkeeping keys before writing.
+
+    ``_audio_path`` and ``_source_text`` are carried on result dicts for
+    later pipeline stages; neither belongs in a file handed to a user.
+    """
+    return {k: v for k, v in result.items() if not k.startswith("_")}
 
 
 def write_zip(results: List[Dict], output_dir: Path, zip_path: Path,
@@ -497,12 +519,41 @@ def write_zip(results: List[Dict], output_dir: Path, zip_path: Path,
             # clip has to ship in this zip alongside its JSON. An ordinary
             # one-file-per-chapter pair has none of this -- its source audio
             # already exists as the user's own file, unchanged.
-            audio_path = result.pop("_audio_path", None)
-            zf.writestr(json_name, json.dumps(result, ensure_ascii=False, indent=2))
+            audio_path = result.get("_audio_path")
+            payload = _public_fields(result)
+            zf.writestr(json_name, json.dumps(payload, ensure_ascii=False, indent=2))
             if audio_path and Path(audio_path).exists():
                 zf.write(audio_path, arcname=result["audio_file"])
     log(f"Wrote {zip_path}")
     return zip_path
+
+
+def write_govorim(results: List[Dict], output_dir: Path, slug: str,
+                  r2_folder: str, log: LogFn) -> List[Path]:
+    """Write one Govorim-format JSON per result, ready to drop into the
+    app's ``public/books/audio/`` folder.
+
+    Files are named ``<slug>-chNN.json``, numbered sequentially in pairing
+    order -- matching how that repo already names its alignment files.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: List[Path] = []
+    for i, result in enumerate(results, start=1):
+        doc = govorim.build_chapter(
+            text=result.get("_source_text", ""),
+            aligned=result.get("words", []),
+            audio_url=govorim.audio_url_for(result["audio_file"], r2_folder),
+            log=log,
+        )
+        path = Path(output_dir) / govorim.chapter_filename(slug, i)
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        written.append(path)
+        log(f"  Wrote {path.name} "
+            f"({len(doc['fragments'])} fragments, "
+            f"{len(doc['word_timings'])} words)")
+    log(f"Wrote {len(written)} Govorim JSON file(s) to {output_dir}")
+    return written
 
 
 def _missing_textgrids(alignment_dir: Path, jobs: List[CorpusJob]) -> List[CorpusJob]:
@@ -518,9 +569,16 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                  num_jobs: int = 2,
                  target_seconds: float = segment_mod.DEFAULT_TARGET,
                  max_seconds: float = segment_mod.DEFAULT_MAX,
+                 govorim_slug: str = "",
+                 r2_folder: str = "",
                  log: LogFn = _null_log,
                  progress: ProgressFn = _null_progress) -> Path:
-    """Full pipeline; returns the produced zip path."""
+    """Full pipeline.
+
+    Returns the produced zip path, or -- when *govorim_slug* is set -- the
+    output directory holding the loose ``<slug>-chNN.json`` files written
+    for the Govorim app instead of a zip.
+    """
     ffmpeg = audio_mod.find_ffmpeg()
     work_dir = Path(tempfile.mkdtemp(prefix="auto_mfa_"))
     try:
@@ -588,6 +646,10 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                               work_dir=work_dir, ffmpeg=ffmpeg)
         if not results:
             raise RuntimeError("Alignment produced no output.")
+        if govorim_slug:
+            write_govorim(results, output_dir, govorim_slug, r2_folder, log)
+            progress(1.0, "done")
+            return output_dir
         zip_path = output_dir / (zip_name or default_zip_name(output_dir))
         write_zip(results, output_dir, zip_path, log)
         progress(1.0, "done")

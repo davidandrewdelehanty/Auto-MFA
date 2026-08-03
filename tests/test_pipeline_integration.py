@@ -16,14 +16,19 @@ ffmpeg to cut) and not be inferred from the TextGrid's own last interval end.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
-from app.pipeline import CorpusJob, Pair, postprocess, prepare_corpus, write_zip
+from app.pipeline import (
+    CorpusJob, Pair, model_present, postprocess, prepare_corpus,
+    run_alignment, run_pipeline, write_zip,
+)
 from app import audio as audio_mod
 
 BYTES_PER_SEC = 32000  # 16 kHz 16-bit mono WAV
@@ -304,6 +309,246 @@ class MultiChapterSplitTest(unittest.TestCase):
             # Order preserved, nothing duplicated.
             seen = [w["text"] for r in results for w in r["words"]]
             self.assertEqual(seen, words)
+
+
+class ModelPresentTest(unittest.TestCase):
+    """Regression test: model_present() must recognize every on-disk shape
+    MFA actually uses. It previously only checked for `<name>.zip` or a
+    bare `<name>` file/dir, which matches acoustic and g2p models but NOT
+    dictionaries -- MFA stores those as a plain-text `<name>.dict`. That
+    made ensure_models() think a dictionary was never cached and
+    re-"download" it (an MFA no-op, but a wasted network round trip and
+    confusing log line) on every single alignment run.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._prev_env = dict(os.environ)
+        os.environ["MFA_ROOT_DIR"] = self._tmp.name
+        self.addCleanup(os.environ.clear)
+        self.addCleanup(os.environ.update, self._prev_env)
+        self.pretrained = Path(self._tmp.name) / "pretrained_models"
+
+    def test_dictionary_dict_file_recognized(self):
+        d = self.pretrained / "dictionary"
+        d.mkdir(parents=True)
+        (d / "russian_mfa.dict").write_text("a a\n", encoding="utf-8")
+        self.assertTrue(model_present("dictionary", "russian_mfa"))
+
+    def test_acoustic_zip_recognized(self):
+        d = self.pretrained / "acoustic"
+        d.mkdir(parents=True)
+        (d / "russian_mfa.zip").write_bytes(b"")
+        self.assertTrue(model_present("acoustic", "russian_mfa"))
+
+    def test_missing_model_reports_absent(self):
+        self.assertFalse(model_present("dictionary", "russian_mfa"))
+
+
+class RunAlignmentG2PFallbackTest(unittest.TestCase):
+    """Regression test: MFA's pretrained model server has, at times, served
+    a g2p model whose phone inventory doesn't match its paired dictionary,
+    and MFA refuses to align AT ALL when that happens -- even though only
+    out-of-dictionary words are affected. run_alignment should retry once
+    without --g2p_model_path instead of failing the whole run.
+    """
+
+    def test_retries_without_g2p_on_mismatch(self):
+        calls = []
+
+        def fake_invoke_mfa(args, log):
+            calls.append(list(args))
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "PronunciationG2PMismatchError:\n"
+                    "There were phones in the G2P model that are not in "
+                    "the dictionary: \nɕ"
+                )
+            return 0
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("app.pipeline.model_present", return_value=True), \
+                mock.patch("app.pipeline.invoke_mfa", side_effect=fake_invoke_mfa):
+            run_alignment(
+                corpus_dir=Path(d) / "corpus",
+                output_dir=Path(d) / "align",
+                temp_dir=Path(d) / "temp",
+                dictionary="russian_mfa",
+                acoustic="russian_mfa",
+                log=lambda msg: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--g2p_model_path", calls[0])
+        self.assertNotIn("--g2p_model_path", calls[1])
+
+    def test_other_errors_are_not_swallowed(self):
+        def fake_invoke_mfa(args, log):
+            raise RuntimeError("some unrelated MFA failure")
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("app.pipeline.model_present", return_value=True), \
+                mock.patch("app.pipeline.invoke_mfa", side_effect=fake_invoke_mfa):
+            with self.assertRaises(RuntimeError):
+                run_alignment(
+                    corpus_dir=Path(d) / "corpus",
+                    output_dir=Path(d) / "align",
+                    temp_dir=Path(d) / "temp",
+                    dictionary="russian_mfa",
+                    acoustic="russian_mfa",
+                    log=lambda msg: None,
+                )
+
+
+class ParallelExportDroppedFilesTest(unittest.TestCase):
+    """Regression test: MFA has been observed, on Windows, to report a
+    fully successful run while silently dropping most of its own alignment
+    output -- e.g. 5 files written out of 29 expected, no error anywhere in
+    MFA's own log. This reproduces identically at --num_jobs 1 (ruling out
+    a parallel-export-specific race), so run_pipeline escalates through
+    --num_jobs 1, then --num_jobs 1 --disable_mp, before giving up.
+    """
+
+    def _job(self, work_dir, i, n_words=2):
+        wav = work_dir / f"000_audio_{i:03d}.wav"
+        txt = work_dir / f"000_audio_{i:03d}.txt"
+        txt.write_text(" ".join(f"w{i}_{k}" for k in range(n_words)), encoding="utf-8")
+        return CorpusJob(0, i, str(wav), str(txt), duration=1.0)
+
+    def test_retries_with_num_jobs_1_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            out_dir = root / "out"
+            jobs = [self._job(work_dir, i) for i in range(4)]
+            calls = []
+
+            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
+                                   dictionary, acoustic, log, num_jobs=2,
+                                   disable_mp=False):
+                calls.append((num_jobs, disable_mp))
+                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+                # First (parallel) attempt: only half the files "export".
+                # Retry (num_jobs=1): all of them do.
+                written = jobs if num_jobs == 1 else jobs[:2]
+                for j in written:
+                    words = Path(j.txt).read_text(encoding="utf-8").split()
+                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
+                    tg.write_text(fake_textgrid(words), encoding="utf-8")
+
+            with mock.patch("app.pipeline.ensure_models"), \
+                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
+                zip_path = run_pipeline(
+                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
+                    acoustic="russian_mfa", dictionary="russian_mfa",
+                    output_dir=out_dir, num_jobs=2, log=print,
+                )
+
+            # parallel attempt, then num_jobs=1 retry -- never needs to
+            # escalate to --disable_mp since the num_jobs=1 retry succeeds.
+            self.assertEqual(calls, [(2, False), (1, False)])
+            self.assertTrue(zip_path.exists())
+
+    def test_escalates_to_disable_mp_if_num_jobs_1_also_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            out_dir = root / "out"
+            jobs = [self._job(work_dir, i) for i in range(4)]
+            calls = []
+
+            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
+                                   dictionary, acoustic, log, num_jobs=2,
+                                   disable_mp=False):
+                calls.append((num_jobs, disable_mp))
+                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+                # Only --disable_mp actually gets everything written --
+                # num_jobs=1 alone reproduces the same partial failure as
+                # the initial attempt (this is the case that ruled out a
+                # parallel-export-specific race in the first place).
+                written = jobs if disable_mp else jobs[:2]
+                for j in written:
+                    words = Path(j.txt).read_text(encoding="utf-8").split()
+                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
+                    tg.write_text(fake_textgrid(words), encoding="utf-8")
+
+            with mock.patch("app.pipeline.ensure_models"), \
+                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
+                zip_path = run_pipeline(
+                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
+                    acoustic="russian_mfa", dictionary="russian_mfa",
+                    output_dir=out_dir, num_jobs=2, log=print,
+                )
+
+            self.assertEqual(calls, [(2, False), (1, False), (1, True)])
+            self.assertTrue(zip_path.exists())
+
+    def test_raises_clearly_if_all_retries_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            out_dir = root / "out"
+            jobs = [self._job(work_dir, i) for i in range(4)]
+
+            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
+                                   dictionary, acoustic, log, num_jobs=2,
+                                   disable_mp=False):
+                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+                # Never writes anything, regardless of args.
+
+            with mock.patch("app.pipeline.ensure_models"), \
+                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_pipeline(
+                        pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
+                        acoustic="russian_mfa", dictionary="russian_mfa",
+                        output_dir=out_dir, num_jobs=2, log=print,
+                    )
+            self.assertIn("4/4", str(ctx.exception))
+
+    def test_num_jobs_1_start_skips_straight_to_disable_mp_retry(self):
+        """If the caller already starts at num_jobs=1 (the GUI's new
+        default), the num_jobs=1 tier is identical to what was already
+        tried -- run_pipeline should skip straight to --disable_mp instead
+        of wastefully repeating the exact same failing call.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            out_dir = root / "out"
+            jobs = [self._job(work_dir, i) for i in range(4)]
+            calls = []
+
+            def fake_run_alignment(corpus_dir, alignment_dir, temp_dir,
+                                   dictionary, acoustic, log, num_jobs=2,
+                                   disable_mp=False):
+                calls.append((num_jobs, disable_mp))
+                Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+                written = jobs if disable_mp else jobs[:2]
+                for j in written:
+                    words = Path(j.txt).read_text(encoding="utf-8").split()
+                    tg = Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid"
+                    tg.write_text(fake_textgrid(words), encoding="utf-8")
+
+            with mock.patch("app.pipeline.ensure_models"), \
+                 mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+                 mock.patch("app.pipeline.run_alignment", side_effect=fake_run_alignment):
+                zip_path = run_pipeline(
+                    pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
+                    acoustic="russian_mfa", dictionary="russian_mfa",
+                    output_dir=out_dir, num_jobs=1, log=print,
+                )
+
+            self.assertEqual(calls, [(1, False), (1, True)])
+            self.assertTrue(zip_path.exists())
 
 
 if __name__ == "__main__":

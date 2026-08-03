@@ -1,3 +1,3 @@
 """Auto-MFA: FB2 audiobook forced alignment GUI."""
 
-__version__ = "1.4.0"
+__version__ = "2.0.1"

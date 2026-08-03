@@ -1,28 +1,41 @@
 # Auto-MFA
 
-A GUI app that aligns audiobook audio files to the text of an FB2
-(FictionBook) e-book using **Montreal Forced Aligner (MFA)**, then packages the
-resulting word/phone alignments as one JSON file per audio track inside a zip.
+A Windows GUI for setting up audiobook forced-alignment jobs against an FB2
+(FictionBook) e-book, which then run under **WSL Ubuntu** using **Montreal
+Forced Aligner (MFA)**. Output is one JSON file per chapter in the schema the
+**Govorim** app reads (`<slug>-chNN.json`).
 
-**Current recommendation: native Windows.** MFA wraps Kaldi, which is
-developed and tested primarily on Linux, so alignment is meaningfully slower
-on native Windows (no `fork()`, so every one of Kaldi's many short-lived
-subprocesses pays full Windows process-creation overhead, plus Windows
-Defender scanning freshly-extracted unsigned binaries) -- WSL Ubuntu was
-tried specifically to fix that, and MFA/Kaldi itself does run correctly
-there. However, the WSLg-hosted Tk GUI hit a separate, unresolved font
-rendering bug (Tk only sees a single system font at all under WSLg on the
-machine this was tested on, so any non-ASCII text -- Cyrillic filenames,
-even this app's own UI symbols -- renders as literal `\uXXXX` escapes
-instead of real characters); several standard fixes (locale, `FONTCONFIG_PATH`,
-installing font packages, even plain Ubuntu's own `python3-tk`) didn't
-resolve it. See [Running under WSL Ubuntu](#running-under-wsl-ubuntu-recommended)
-below if you want to pick that investigation back up. In the meantime, the
-correctness issue that originally motivated trying WSL -- MFA silently
-dropping alignment output on Windows -- is now handled directly:
-`run_pipeline` verifies the expected output exists and retries with
-escalating fallbacks (`--num_jobs 1`, then `--disable_mp`) before failing
-loudly, so native Windows is reliable, just slower per run.
+**The GUI does not run alignment.** You pick a folder, pair audio files with
+chapters, set options, and press *Generate script*; it writes an
+`align_<slug>.sh` plus a job file, and you run that one command in an Ubuntu
+terminal. This split is deliberate — see *Why a script generator* below.
+
+## Why a script generator
+
+Running MFA natively on Windows was tried first and is a dead end for this
+workload:
+
+- **It's slow.** MFA wraps Kaldi, which spawns many short-lived subprocesses
+  per job. Windows has no `fork()`, so each one pays full `CreateProcess`
+  overhead, and Defender real-time-scans freshly extracted unsigned binaries.
+- **It silently loses data.** MFA repeatedly reported a fully successful run
+  ("Finished exporting TextGrids!", "Done!") while writing only 5 of 29
+  expected TextGrid files, with no error anywhere in its own log — at *every*
+  `--num_jobs` setting, including 1, which rules out a parallel-export race.
+  The likely cause is Windows' `spawn`-based multiprocessing (a classic source
+  of silent subprocess failures that `fork()`-based Linux never hits).
+
+Running the whole GUI under WSL instead fixes MFA but breaks the UI: under
+WSLg, Tk sees only a **single** system font, so Cyrillic filenames and chapter
+titles — and even this app's own UI symbols — render as literal `\uXXXX`
+escapes. Locale settings, `FONTCONFIG_PATH`, installing font packages, and
+plain Ubuntu's own `python3-tk` all failed to resolve it.
+
+Generating a script sidesteps both problems: the GUI stays native Windows,
+where Tk has real fonts and Cyrillic displays correctly, and the alignment
+runs in Linux, where MFA is fast and correct. `run_pipeline`'s
+verify-and-retry safety net (`--num_jobs 1`, then `--disable_mp`) is still in
+place, but should never need to fire on Linux.
 
 ## How it works
 
@@ -39,12 +52,15 @@ loudly, so native Windows is reliable, just slower per run.
      (click-drag, or click + shift-click) before pairing. The pipeline
      figures out exactly where each chapter starts by how far through that
      one audio file its words land (using the alignment's own output, not a
-     guess), then physically cuts the audio into one clip per chapter. Those
-     cut clips ship inside the output zip alongside their JSONs, since
-     nothing like them exists elsewhere yet.
-3. Press **BEGIN**.
-4. The app:
-   - converts each audio file to a 16 kHz mono WAV (via bundled `ffmpeg`),
+     guess), then physically cuts the audio into one clip per chapter.
+3. Fill in the **Book slug** (names every output file, e.g. `chekhov-dama` →
+   `chekhov-dama-ch01.json`) and, optionally, the **R2 folder** used to build
+   each `audio_url`.
+4. Press **GENERATE SCRIPT**. The GUI writes `align_<slug>.sh` and
+   `align_<slug>.job.json` into the output folder and copies the run command
+   to your clipboard.
+5. Paste that command into an Ubuntu (WSL) terminal. From there the pipeline:
+   - converts each audio file to a 16 kHz mono WAV (via `ffmpeg`),
    - splits **every** chapter's audio into short (~30s, configurable)
      utterances, snapped to detected silence so a cut never lands mid-word
      (falls back to a hard time-based cut if a stretch has no pause), and
@@ -63,22 +79,48 @@ loudly, so native Windows is reliable, just slower per run.
      (exactly what was cut from the audio) as the time offset — not MFA's own
      aligned output, which can trim trailing silence and would otherwise
      make every later segment in a chapter drift a little early,
-   - writes `alignments_<folder>_<timestamp>.zip` with one `<track>.json` per
-     audio file into the output folder.
+   - writes one `<slug>-chNN.json` per chapter into the output folder.
 
-### JSON format
+### JSON format (Govorim)
+
+Verified against a real file in the Govorim repo, not guessed:
 
 ```json
 {
-  "audio_file": "01.mp3",
-  "title": "Глава 1",
-  "duration": 1742.64,
-  "words":   [ {"word": "привет", "start": 12.34, "end": 12.87}, ... ],
-  "phones":  [ {"text": "p", "start": 12.34, "end": 12.45}, ... ]
+  "audio_url": "https://pub-....r2.dev/dama/ch1.mp3",
+  "narrator": "audiobook",
+  "fragments": [
+    {"text": "Говорили, что на набережной появилось новое лицо.",
+     "begin": 0.291, "end": 7.481,
+     "words": [{"word": "Говорили,", "begin": 0.291, "end": 1.493}, "..."]}
+  ],
+  "word_timings": [{"word": "Говорили,", "begin": 0.291, "end": 1.493}, "..."]
 }
 ```
 
-Empty intervals (silence) are omitted.
+Three things about this schema are easy to get wrong, and `app/govorim.py`
+exists to handle them:
+
+- **`begin`, not `start`.** MFA and the rest of this app use `start`
+  internally; Govorim reads `begin`. Word entries likewise use `word`, not
+  `text`. There are no `phones` — that tier is dropped.
+- **Original surface forms.** MFA aligns a *normalized* transcript
+  (lowercased, punctuation and digits stripped — that's what its
+  pronunciation dictionary can look up), but Govorim displays real book
+  text. So every aligned word is mapped back onto the original token it came
+  from: `Говорили,` with its capital and comma, not `говорили`. A hyphenated
+  token like `какого-то` normalizes to two words but stays one highlightable
+  token spanning both.
+- **Sentence fragments.** Words are regrouped into sentences using the same
+  splitting rule Govorim's own sentence-level build script uses, so fragments
+  chunk the way already-shipped books do.
+
+One known difference from the older WhisperX-produced files: tokens that
+normalize to nothing — a bare `—` or `–`, a standalone number — get **no**
+entry here, because the aligner never saw them and there is no honest timing
+to report. WhisperX did emit dash tokens. If Govorim's highlighting matches
+`word_timings` to rendered spans strictly by index, verify that against a
+chapter containing dashes before bulk-processing a library.
 
 ## Multiple languages (French/German/English passages)
 
@@ -111,131 +153,107 @@ second refinement pass on just that span with the matching French/German/
 English model) is a real, buildable feature, just a meaningfully bigger one
 than a first cut — flag it if it's worth the effort for your books.
 
-## What is bundled
+## One-time setup
 
-MFA 3.x depends on `kalpy`/`kaldi`, compiled native components that are **only
-distributed through conda** (there are no pip wheels), so a pure
-pip + PyInstaller bundle of MFA is impossible. Instead:
-
-```
-dist\Auto-MFA\
-  Auto-MFA.exe   small GUI shell (Tkinter only, built with PyInstaller)
-  runtime\       relocatable MFA runtime (conda-pack of a conda-forge env)
-                 containing python + montreal-forced-aligner + kalpy + kaldi
-                 + ffmpeg/ffprobe
-```
-
-The GUI runs MFA inside `runtime` as a separate windowed (`pythonw`) process,
-so no console window flashes and a crash inside MFA never takes down the UI.
-The whole `dist\Auto-MFA` folder is self-contained and can be moved anywhere.
-
-## Running under WSL Ubuntu (recommended)
-
-Prerequisites: Windows 10/11 with WSL installed
-(https://learn.microsoft.com/en-us/windows/wsl/install — `wsl --install` from
-an elevated PowerShell prompt is normally all it takes, and it defaults to
-Ubuntu) and WSLg, which ships with modern WSL and lets Linux GUI apps like
-this one display as ordinary windows on your Windows desktop — no X server
-to set up.
-
-From an Ubuntu terminal, in this project's folder:
-
-```bash
-./setup_wsl.sh   # one-time: installs Miniconda (if needed) + creates the MFA env
-./run.sh         # launches the GUI
-```
-
-`setup_wsl.sh` mirrors what `build.ps1` does for the Windows build (creates a
-`python=3.11 montreal-forced-aligner kaldi=*=cpu* ffmpeg` conda-forge env) but
-does *not* freeze anything into a standalone executable or relocate the
-environment -- there's no need to, since you're not distributing this to a
-different machine. It just sets up a normal conda env and generates `run.sh`
-to launch the app straight from source against that env's own Python, using
-the exact same code path already used for "Running from source" below.
-Re-running `setup_wsl.sh` is safe and fast once the env already exists.
-
-**Keep working files on the Linux side.** If this project folder lives under
-`/mnt/c/...` (the Windows filesystem, mounted into WSL), that's fine for the
-small app source itself, but point the GUI's *Book folder* and *Output
-folder* at paths inside the Linux filesystem instead (e.g. `~/audiobooks`) --
-crossing the Windows/Linux filesystem boundary for the audio files and MFA's
-own working files is slow and cancels out much of the speed gain WSL is
-otherwise giving you. `setup_wsl.sh` prints a reminder of this if it detects
-itself running from `/mnt/...`.
-
-## Building (native Windows)
-
-Prerequisites: Windows, PowerShell 5.1+. The script auto-downloads Miniconda
-into `build\miniconda` on first run (a conda install is required to build the
-runtime).
+**1. Install WSL** (skip if you already have Ubuntu). From an elevated
+PowerShell prompt:
 
 ```powershell
-.\build.ps1
+wsl --install
 ```
 
-This:
+**2. Create the MFA environment.** From an Ubuntu (WSL) terminal, in this
+project's folder:
 
-1. builds the small GUI shell with PyInstaller (fast),
-2. creates a conda env (`python=3.11 montreal-forced-aligner kaldi=*=cpu*
-   ffmpeg` from conda-forge),
-3. installs this project's `app` package into the env,
-4. `conda-pack`s the env into `dist\Auto-MFA\runtime` so it is relocatable,
-5. verifies `montreal_forced_aligner` imports in the packed runtime.
+```bash
+bash setup_wsl.sh
+```
 
-Flags: `-SkipGui` / `-SkipRuntime` to rebuild only one half, `-NoConda` to fail
-instead of downloading Miniconda.
+This installs Miniconda if needed and builds a conda-forge env with MFA,
+Kaldi, OpenFST and ffmpeg in it (~1–2 GB, several minutes). Re-running it is
+safe and fast once the env exists.
+
+**3. Build the Windows GUI** (see *Building the GUI* below), or just run it
+from source with any Python 3.10+ that has tkinter.
+
+The GUI itself needs **only tkinter** — it no longer needs MFA, conda, or the
+bundled runtime, because it doesn't run alignment.
+
+**Where to keep your audio.** Paths under `/mnt/c/...` (the Windows
+filesystem, mounted into WSL) work fine and are the simplest option, since
+that's where your books already live — the GUI translates Windows paths to
+`/mnt/c/...` automatically. Crossing that boundary is slower than the native
+Linux filesystem, though, so if a book is large and you care about the last
+bit of speed, copy it to e.g. `~/audiobooks` first and point the GUI's
+*Output folder* there.
+
+## Building the GUI
+
+Prerequisites: Windows, PowerShell 5.1+.
+
+```powershell
+.\build.ps1 -SkipRuntime
+```
+
+`-SkipRuntime` is now the normal case: the GUI only needs tkinter, so the
+conda-packed MFA runtime that used to ship next to it is no longer required.
+A plain `.\build.ps1` still builds that runtime if you want a self-contained
+Windows fallback, but nothing in the current workflow uses it.
 
 ## Running from source (development)
 
-You need a working MFA environment (conda-forge) on your machine:
+The GUI needs nothing but Python and tkinter:
 
 ```powershell
-conda create -n aligner -c conda-forge montreal-forced-aligner kaldi=*=cpu* ffmpeg
-conda activate aligner
 python app/main.py          # or: python -m app.main
 ```
 
-The GUI spawns the worker with the same interpreter it is running under, so
-when launched from a conda env it uses that env's MFA. (For a frozen build it
-uses the bundled `runtime` instead.)
+The alignment half (`app/pipeline.py`, driven by `--worker align`) needs a
+conda-forge MFA env, which is exactly what `setup_wsl.sh` creates on the
+Linux side. To run the worker by hand:
+
+```bash
+conda activate ~/miniconda3/envs/auto-mfa
+python app/main.py --worker align /path/to/align_<slug>.job.json
+```
 
 ## Notes & tips
 
 - **First run needs internet**: the acoustic model / dictionary / g2p model are
-  downloaded once into `%USERPROFILE%\Documents\MFA`. Use the
-  *Download models* button to fetch them ahead of time.
+  downloaded once into `~/Documents/MFA` on the Linux side, then reused.
 - **Target utterance length (s)**: every chapter is split into utterances
   around this long (default 30s), snapped to silence. The hard cap used if no
   silence is found in time is 1.5× this value (45s at the default). Lower it
   if you still see memory pressure; raise it (cautiously) if alignment seems
   too fragmented on very clean, pause-heavy narration.
-- **Parallel jobs**: MFA workers to run concurrently (default 1). On
-  Windows, MFA has been observed to silently drop most of its own alignment
-  output regardless of this setting -- not specifically a parallel-export
-  bug, more likely Windows' lack of `fork()` (multiprocessing there must use
-  the `spawn` start method, a well-known source of silent subprocess
-  failures fork()-based systems don't hit). The app auto-detects this and
-  retries with escalating fallbacks (`--num_jobs 1`, then `--disable_mp`)
-  regardless of what this is set to, but starting at 1 skips paying for a
-  failed first attempt every time on Windows. Try raising it on a machine
-  with more CPU cores/RAM to speed up alignment (plain `mfa` from a Linux
-  shell hasn't shown this issue at all); keep it at 1 if you hit memory
-  pressure even with short utterances.
+- **Parallel jobs**: MFA workers to run concurrently (default 2). Raise it on
+  a machine with more CPU cores/RAM to speed up alignment; lower it to 1 if
+  you hit memory pressure even with short utterances. The silent-output-loss
+  bug that forced this to 1 was Windows-only; the pipeline still verifies its
+  own output and retries (`--num_jobs 1`, then `--disable_mp`) if it ever
+  reappears.
 - **Out-of-dictionary words**: MFA auto-uses the Russian g2p model to cover
   words missing from the dictionary. Numbers and punctuation are stripped from
   the transcript before alignment.
-- **Unpaired audio** is skipped; you are asked to confirm before BEGIN.
+- **Unpaired audio** is skipped; you are asked to confirm before generating.
+- **Re-running a script is safe** — `align_<slug>.sh` and its job file stay in
+  the output folder, so you can re-run a book without touching the GUI, and
+  edit the job JSON by hand if you only need to tweak one setting.
 - Keep temporary files on to debug: the temp corpus, converted WAVs and raw
-  TextGrids are kept under `%TEMP%\auto_mfa_*`.
+  TextGrids are kept under `/tmp/auto_mfa_*` on the Linux side.
 
 ## Layout
 
 ```
 app/
   main.py        entry point (GUI, or --worker mode)
-  gui.py         Tkinter GUI: folder picker, pairing, options, live log
+  gui.py         Tkinter GUI: folder picker, pairing, options, script output
+  scriptgen.py   WSL path translation, slugs, generated bash script (no Tk,
+                 so it is unit-testable without a display)
+  govorim.py     Govorim JSON format: surface-form remapping, sentence
+                 fragments, word_timings
   worker.py      headless worker process (align / download-models)
-  pipeline.py    corpus prep -> MFA -> TextGrid->JSON -> zip
+  pipeline.py    corpus prep -> MFA -> TextGrid -> JSON
   fb2.py         FB2 parsing (recurses nested Part/Chapter sections) +
                  transcript normalization
   segment.py     silence-aware utterance segmentation (the OOM fix)
@@ -244,8 +262,8 @@ app/
                  duration)
   audio.py       ffmpeg wrappers (convert, probe, split)
 tests/           unit + integration tests (integration needs ffmpeg)
-Auto-MFA.spec    PyInstaller spec (GUI shell only, native-Windows build)
-build.ps1        native-Windows build: GUI shell + conda-pack MFA runtime
-setup_wsl.sh     WSL/Linux setup: creates the conda env + generates run.sh
-run.sh           generated by setup_wsl.sh; launches the GUI under WSL/Linux
+Auto-MFA.spec    PyInstaller spec (GUI shell)
+build.ps1        Windows build; use -SkipRuntime (the GUI needs only tkinter)
+setup_wsl.sh     WSL/Linux setup: creates the conda env with MFA in it
+align_<slug>.sh  generated per book by the GUI; what you actually run
 ```

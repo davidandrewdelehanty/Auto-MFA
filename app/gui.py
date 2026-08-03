@@ -1,12 +1,28 @@
-"""Tkinter GUI for Auto-MFA."""
+"""Tkinter GUI for Auto-MFA.
+
+This GUI does NOT run alignment. It is a job *setup* tool: you pick a book
+folder, pair audio files with FB2 chapters, set the output options, and it
+writes out a small job file plus a shell script that runs the alignment
+under WSL Ubuntu (or any Linux).
+
+Why it works this way: MFA wraps Kaldi, which is developed and tested on
+Linux. Running it natively on Windows is both much slower (no fork(), so
+every one of Kaldi's many short-lived subprocesses pays full CreateProcess
+overhead, plus Defender real-time-scanning freshly extracted unsigned
+binaries) and, in practice, unreliable -- MFA was repeatedly observed
+reporting a fully successful run while silently writing only 5 of 29
+expected TextGrid files, at every --num_jobs setting. Running the GUI
+itself under WSL instead was tried and hit a separate wall: WSLg's Tk sees
+only a single system font, so Cyrillic filenames and chapter titles render
+as literal \\uXXXX escapes.
+
+Generating a script sidesteps both. The GUI stays native Windows, where Tk
+has real fonts and Cyrillic displays correctly; the alignment runs in
+Linux, where MFA is fast and correct.
+"""
 
 import json
-import os
-import queue
-import subprocess
 import sys
-import tempfile
-import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -15,36 +31,32 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .fb2 import extract_chapters, find_audio_files, find_fb2, transcript_words
-from .pipeline import default_zip_name
+from .scriptgen import build_script, run_command_for, slugify, to_wsl_path
 
-_MSG_PREFIXES = ("@STATUS|", "@PROGRESS|", "@DONE|", "@ERROR|")
+WSL_INSTALL_URL = "https://learn.microsoft.com/en-us/windows/wsl/install"
 
 
 class AutoMfaApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"Auto-MFA v{__version__}")
-        self.geometry("980x720")
-        self.minsize(820, 600)
+        self.title(f"Auto-MFA v{__version__} — WSL script generator")
+        self.geometry("1000x760")
+        self.minsize(860, 640)
 
         self.book_folder = tk.StringVar()
         self.output_folder = tk.StringVar()
         self.acoustic_model = tk.StringVar(value="russian_mfa")
         self.dictionary = tk.StringVar(value="russian_mfa")
         self.target_seconds = tk.StringVar(value="30")
-        # Default to 1: on Windows, MFA has been observed to silently drop
-        # most of its own output (e.g. 5 TextGrids written out of 29
-        # expected) while still reporting success, regardless of
-        # --num_jobs -- this is a Windows multiprocessing-pool issue, not
-        # specifically about parallel export (see run_pipeline's automatic
-        # detect + escalating retry in pipeline.py, which stays in place as
-        # a safety net either way). Raise this back to 2+ in the field below
-        # if you want to try it -- alignment itself is faster with more
-        # jobs when it works, the auto-retry will still catch it if it
-        # doesn't.
-        self.num_jobs = tk.StringVar(value="1")
+        # Back to 2 now that alignment runs on Linux: the silent-output-loss
+        # bug that forced this to 1 was Windows-only (and pipeline.py's
+        # escalating retry still covers it if it ever appears here).
+        self.num_jobs = tk.StringVar(value="2")
         self.auto_download = tk.BooleanVar(value=True)
         self.keep_temp = tk.BooleanVar(value=False)
+        self.book_slug = tk.StringVar()
+        self.r2_folder = tk.StringVar()
+        self.project_dir = tk.StringVar(value=self._default_project_dir())
 
         self.chapters = []
         self.audio_files: list[Path] = []
@@ -53,12 +65,20 @@ class AutoMfaApp(tk.Tk):
         # single audio file spans that whole (contiguous) run of chapters,
         # e.g. a "whole book" recording; see _pair_selected / _build_job.
         self.pairs: list[tuple[int, tuple[int, ...]]] = []
-        self._busy = False
-        self._proc = None
-        self._msg_queue: "queue.Queue[str]" = queue.Queue()
 
         self._build_widgets()
-        self.after(100, self._drain_queue)
+
+    @staticmethod
+    def _default_project_dir() -> str:
+        """WSL-side path of this project, for the generated script.
+
+        Running from source this is exact. In a frozen build the .py files
+        aren't next to the executable, so fall back to the conventional
+        location and let the user correct the field.
+        """
+        if not getattr(sys, "frozen", False):
+            return to_wsl_path(Path(__file__).resolve().parent.parent)
+        return to_wsl_path(Path.home() / "projects" / "Auto-MFA")
 
     # ------------------------------------------------------------------ UI
     def _build_widgets(self) -> None:
@@ -76,27 +96,17 @@ class AutoMfaApp(tk.Tk):
         ttk.Button(top, text="Browse…", command=self._browse_folder).grid(
             row=0, column=2)
 
-        # This build runs MFA through Windows-native conda/kaldi binaries,
-        # which are meaningfully slower than the same alignment on Linux
-        # (Windows lacks fork(), pays CreateProcess overhead on every one of
-        # Kaldi's many short-lived subprocess calls, and unsigned freshly
-        # extracted binaries get real-time-scanned by Defender). Nudge
-        # people toward WSL, where this same app runs directly against a
-        # normal Linux conda env with none of that overhead -- only shown
-        # when actually running natively on Windows, not inside WSL itself.
         if sys.platform == "win32":
             wsl_hint = ttk.Label(
                 top,
-                text=("Running on Windows? Alignment is noticeably faster "
-                      "under WSL Ubuntu -- click for setup instructions"),
+                text=("This generates a script to run under WSL Ubuntu — "
+                      "click here if you still need to install it"),
                 foreground="#0645AD", cursor="hand2",
                 font=("Segoe UI", 9, "underline"),
             )
             wsl_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-            wsl_hint.bind(
-                "<Button-1>",
-                lambda e: webbrowser.open("https://learn.microsoft.com/en-us/windows/wsl/install"),
-            )
+            wsl_hint.bind("<Button-1>",
+                          lambda e: webbrowser.open(WSL_INSTALL_URL))
 
         # Pairing panes
         pairing = ttk.Frame(root)
@@ -130,9 +140,27 @@ class AutoMfaApp(tk.Tk):
         pairs_frame.rowconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
 
-        # Options
+        # Govorim output options
+        gov = ttk.LabelFrame(root, text="Govorim output", padding=6)
+        gov.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        gov.columnconfigure(1, weight=1)
+        gov.columnconfigure(3, weight=1)
+        ttk.Label(gov, text="Book slug:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(gov, textvariable=self.book_slug).grid(
+            row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(gov, text="R2 folder:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(gov, textvariable=self.r2_folder).grid(
+            row=0, column=3, sticky="ew", padx=4)
+        ttk.Label(
+            gov,
+            text=("Files are written as <slug>-ch01.json … ; R2 folder builds "
+                  "each audio_url (leave blank to fill in later)."),
+            foreground="#555555",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 0))
+
+        # Alignment options
         opts = ttk.LabelFrame(root, text="Alignment options", padding=6)
-        opts.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        opts.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         opts.columnconfigure(1, weight=1)
         opts.columnconfigure(3, weight=1)
         ttk.Label(opts, text="Acoustic model:").grid(row=0, column=0, sticky="w")
@@ -152,25 +180,27 @@ class AutoMfaApp(tk.Tk):
             row=2, column=1, columnspan=2, sticky="ew", padx=4)
         ttk.Button(opts, text="Browse…", command=self._browse_output).grid(
             row=2, column=3, sticky="w")
+        ttk.Label(opts, text="Auto-MFA folder (WSL path):").grid(row=3, column=0, sticky="w")
+        ttk.Entry(opts, textvariable=self.project_dir).grid(
+            row=3, column=1, columnspan=3, sticky="ew", padx=4)
         ttk.Checkbutton(opts, text="Auto-download missing models",
                         variable=self.auto_download).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(opts, text="Keep temporary files",
                         variable=self.keep_temp).grid(
-            row=3, column=2, columnspan=2, sticky="w", pady=(4, 0))
+            row=4, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
         # Buttons
         btns = ttk.Frame(root)
-        btns.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        self.btn_download = ttk.Button(
-            btns, text="Download models", command=self._download_models)
-        self.btn_download.pack(side="left")
-        self.btn_begin = ttk.Button(
-            btns, text="BEGIN", command=self._begin, style="Accent.TButton")
-        self.btn_begin.pack(side="right")
-
-        self.progress = ttk.Progressbar(root, maximum=100, mode="determinate")
-        self.progress.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        btns.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.btn_generate = ttk.Button(
+            btns, text="GENERATE SCRIPT", command=self._generate,
+            style="Accent.TButton")
+        self.btn_generate.pack(side="right")
+        self.btn_copy_cmd = ttk.Button(
+            btns, text="Copy run command", command=self._copy_command,
+            state="disabled")
+        self.btn_copy_cmd.pack(side="right", padx=(0, 6))
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=4)
         log_frame.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
@@ -195,6 +225,8 @@ class AutoMfaApp(tk.Tk):
         ttk.Button(log_btns, text="Copy log", command=self._copy_log).pack(
             side="right")
         root.rowconfigure(6, weight=3)
+
+        self._run_command = ""
 
     def _make_listbox(self, parent: ttk.Frame, label: str, col: int,
                       selectmode: str = "browse") -> tk.Listbox:
@@ -227,6 +259,8 @@ class AutoMfaApp(tk.Tk):
             return
         self.pairs = []
         self.output_folder.set(str(folder))
+        if not self.book_slug.get().strip():
+            self.book_slug.set(slugify(folder.name))
 
         self.audio_list.delete(0, "end")
         for a in self.audio_files:
@@ -243,7 +277,7 @@ class AutoMfaApp(tk.Tk):
                 "No audio", "No supported audio files found in this folder.")
 
     def _browse_output(self) -> None:
-        chosen = filedialog.askdirectory(title="Choose output folder for the zip")
+        chosen = filedialog.askdirectory(title="Choose output folder for the JSONs")
         if chosen:
             self.output_folder.set(chosen)
 
@@ -326,8 +360,13 @@ class AutoMfaApp(tk.Tk):
             self.pairs_list.insert(
                 "end", f"{self.audio_files[audio_idx].name}  ⇄  {label}")
 
-    # --------------------------------------------------------- pipeline
-    def _build_job(self) -> Path:
+    # --------------------------------------------------- script generation
+    def _build_job(self) -> dict:
+        """Assemble the job dict the Linux-side worker will read.
+
+        Every path in here is translated to its WSL form, since nothing in
+        this dict is ever consumed by Windows.
+        """
         try:
             target_seconds = float(self.target_seconds.get())
             if target_seconds <= 0:
@@ -347,10 +386,11 @@ class AutoMfaApp(tk.Tk):
         # Mirrors the 30s/45s target/max ratio proven out on the govorim
         # audiobook pipeline (see segment.py's module docstring).
         max_seconds = target_seconds * 1.5
-        job = {
+        out_dir = self.output_folder.get() or self.book_folder.get()
+        return {
             "pairs": [
                 {
-                    "audio": str(self.audio_files[a]),
+                    "audio": to_wsl_path(self.audio_files[a]),
                     "title": (
                         self.chapters[cs[0]]["title"] if len(cs) == 1
                         else f"{self.chapters[cs[0]]['title']} - {self.chapters[cs[-1]]['title']}"
@@ -365,31 +405,46 @@ class AutoMfaApp(tk.Tk):
                          for c in cs]
                         if len(cs) > 1 else None
                     ),
+                    # Original per-chapter text, needed by the Govorim
+                    # writer (which reproduces real punctuation, so the
+                    # normalized transcript is not enough). See Pair.sub_texts.
+                    "sub_texts": (
+                        [self.chapters[c]["text"] for c in cs]
+                        if len(cs) > 1 else None
+                    ),
                 }
                 for a, cs in self.pairs
             ],
             "acoustic_model": self.acoustic_model.get().strip() or "russian_mfa",
             "dictionary": self.dictionary.get().strip() or "russian_mfa",
-            "output_dir": self.output_folder.get() or self.book_folder.get(),
+            "output_dir": to_wsl_path(out_dir),
             "target_seconds": target_seconds,
             "max_seconds": max_seconds,
             "num_jobs": num_jobs,
-            "zip_name": default_zip_name(Path(self.output_folder.get() or ".")),
             "auto_download": self.auto_download.get(),
             "keep_temp": self.keep_temp.get(),
+            "govorim_slug": self.book_slug.get().strip(),
+            "r2_folder": self.r2_folder.get().strip(),
         }
-        fd, path = tempfile.mkstemp(prefix="auto_mfa_job_", suffix=".json")
-        with open(fd, "w", encoding="utf-8") as fh:
-            json.dump(job, fh, ensure_ascii=False)
-        return Path(path)
 
-    def _begin(self) -> None:
-        if self._busy:
-            return
+    def _script_text(self, slug: str, job_wsl_path: str) -> str:
+        """The bash script that runs this job under WSL."""
+        project = self.project_dir.get().strip() or self._default_project_dir()
+        return build_script(slug, job_wsl_path, project, __version__)
+
+    def _generate(self) -> None:
         if not self.pairs:
-            messagebox.showinfo("Nothing to do", "Pair at least one audio file with a chapter.")
+            messagebox.showinfo("Nothing to do",
+                                "Pair at least one audio file with a chapter.")
             return
-        unpaired = {i for i in range(len(self.audio_files))} - {a for a, _ in self.pairs}
+        slug = self.book_slug.get().strip()
+        if not slug:
+            messagebox.showerror(
+                "Book slug required",
+                "Enter a book slug -- it names every output file "
+                "(e.g. 'chekhov-dama' produces chekhov-dama-ch01.json).")
+            return
+        unpaired = set(range(len(self.audio_files))) - {a for a, _ in self.pairs}
         if unpaired:
             names = ", ".join(self.audio_files[i].name for i in sorted(unpaired))
             if not messagebox.askyesno(
@@ -398,196 +453,49 @@ class AutoMfaApp(tk.Tk):
                 "Continue anyway?"):
                 return
         try:
-            job_path = self._build_job()
+            job = self._build_job()
         except Exception:  # noqa: BLE001
             return
-        self._set_busy(True)
-        self._start_worker(["align", str(job_path)])
 
-    def _download_models(self) -> None:
-        if self._busy:
-            return
-        acoustic = self.acoustic_model.get().strip() or "russian_mfa"
-        dictionary = self.dictionary.get().strip() or "russian_mfa"
-        self._set_busy(True)
-        self._start_worker(["download-models", acoustic, dictionary])
-
-    # ------------------------------------------------------- worker
-    def _runtime_python(self):
-        """Path to the bundled MFA runtime's interpreter (if present).
-
-        Prefers pythonw.exe (windowed) so no console window flashes while the
-        worker runs; it still writes to the GUI's pipe (verified on Windows).
-        """
-        if not getattr(sys, "frozen", False):
-            return None
-        base = Path(sys.executable).parent / "runtime"
-        for name in ("pythonw.exe", "python.exe"):
-            candidate = base / name
-            if candidate.is_file():
-                return candidate
-        return None
-
-    def _base_env(self) -> dict:
-        """Env vars every worker invocation needs, regardless of how it is
-        launched.
-
-        PYTHONUTF8 forces Python's UTF-8 mode, which is what decides the
-        *default* text encoding used by `open()` calls that don't pass their
-        own `encoding=` -- including ones deep inside MFA/kalpy that we don't
-        control. Without it, Windows falls back to the system locale codepage
-        (commonly cp1252), and writing/reading the Cyrillic corpus text
-        crashes with "'charmap' codec can't encode characters...". This has
-        to be an env var (not e.g. a `-X utf8` flag) because MFA spawns its
-        own worker subprocesses for parallel jobs, and only env vars survive
-        that re-exec automatically. PYTHONIOENCODING is set too as a
-        belt-and-suspenders for stdio specifically.
-        """
-        env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
-        return env
-
-    def _runtime_env(self, runtime_python):
-        """Return an env dict with the runtime's bin dirs on PATH, so DLLs
-        (kaldi, ffmpeg, MKL...) are found even though the env is not activated.
-        """
-        runtime = Path(runtime_python).parent
-        bin_dirs = [
-            runtime / "Library" / "mingw-w64" / "bin",
-            runtime / "Library" / "bin",
-            runtime / "Scripts",
-            runtime,
-        ]
-        env = self._base_env()
-        existing = env.get("PATH", "")
-        prefix = os.pathsep.join(str(d) for d in bin_dirs)
-        env["PATH"] = prefix + os.pathsep + existing
-        return env
-
-    def _worker_command(self, args: list[str]) -> tuple[list[str], dict | None]:
-        runtime_py = self._runtime_python()
-        if runtime_py is not None:
-            return (
-                [str(runtime_py), "-m", "app.main", "--worker", *args],
-                self._runtime_env(runtime_py),
-            )
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--worker", *args], self._base_env()
-        # Source mode: invoke main.py as a script (it bootstraps the project
-        # root onto sys.path itself), so cwd does not matter.
-        script = Path(__file__).resolve().parent / "main.py"
-        return [sys.executable, str(script), "--worker", *args], self._base_env()
-
-    def _start_worker(self, args: list[str]) -> None:
-        cmd, extra_env = self._worker_command(args)
-        self.log("$ " + " ".join(str(c) for c in cmd))
+        dest = Path(self.output_folder.get() or self.book_folder.get())
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                env=extra_env,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Failed to start worker", str(exc))
-            self._set_busy(False)
+            dest.mkdir(parents=True, exist_ok=True)
+            job_path = dest / f"align_{slug}.job.json"
+            script_path = dest / f"align_{slug}.sh"
+            job_path.write_text(
+                json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+            # newline="\n" is essential: a bash script written with Windows
+            # CRLF endings fails at the shebang with a confusing
+            # "bad interpreter: /usr/bin/env bash^M" error.
+            script_path.write_text(
+                self._script_text(slug, to_wsl_path(job_path)),
+                encoding="utf-8", newline="\n")
+        except OSError as exc:
+            messagebox.showerror("Could not write script", str(exc))
             return
-        self._proc = proc
-        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
 
-    def _reader(self, proc: subprocess.Popen) -> None:
-        for line in proc.stdout:
-            self._msg_queue.put(line)
-        code = proc.wait()
-        self._msg_queue.put(f"__EXIT__{code}")
+        self._run_command = run_command_for(to_wsl_path(script_path))
+        self.btn_copy_cmd.configure(state="normal")
 
-    def _drain_queue(self) -> None:
-        exited = False
-        while True:
-            try:
-                line = self._msg_queue.get_nowait()
-            except queue.Empty:
-                break
-            if line.startswith("__EXIT__"):
-                exited = True
-                code = int(line[len("__EXIT__"):])
-                if self._busy and not self._done_received:
-                    if code != 0:
-                        self.log(f"[worker exited with code {code}]")
-                        messagebox.showerror(
-                            "Alignment failed",
-                            "The worker process failed. See the log for details.")
-                    else:
-                        self.log("[worker finished]")
-                    self._set_busy(False)
-            else:
-                self._handle_line(line)
-        if not exited:
-            self.after(100, self._drain_queue)
+        n_out = sum(len(cs) for _, cs in self.pairs)
+        self.log("---")
+        self.log(f"Wrote {script_path.name} and {job_path.name} to {dest}")
+        self.log(f"{len(self.pairs)} audio file(s) -> {n_out} output JSON(s) "
+                 f"named {slug}-ch01.json …")
+        self.log("Run this in an Ubuntu (WSL) terminal:")
+        self.log(f"    {self._run_command}")
+        messagebox.showinfo(
+            "Script ready",
+            f"Wrote:\n{script_path}\n\n"
+            f"Run it in an Ubuntu (WSL) terminal:\n\n{self._run_command}\n\n"
+            "(the run command is on your clipboard)")
+        self._copy_command()
 
-    def _handle_line(self, line: str) -> None:
-        line = line.rstrip("\n")
-        if line.startswith("@STATUS|"):
-            self.log(line[len("@STATUS|"):])
-        elif line.startswith("@PROGRESS|"):
-            _, frac, msg = line.split("|", 2)
-            if msg == "aligning":
-                # The actual `mfa align` run is one long synchronous call
-                # with no progress callback back into this app -- it can
-                # run for many minutes on a full chapter with nothing to
-                # report in between. A determinate bar frozen at 0% for
-                # that whole stretch reads as "hung", so switch to an
-                # animated indeterminate bar for just this phase: an
-                # honest "still working, no ETA available" signal instead
-                # of a number we can't actually back up.
-                self._set_progress_indeterminate(True)
-            else:
-                self._set_progress_indeterminate(False)
-                try:
-                    self.progress["value"] = float(frac) * 100
-                except ValueError:
-                    pass
-            if msg:
-                self.log(msg)
-        elif line.startswith("@DONE|"):
-            self._done_received = True
-            self._set_progress_indeterminate(False)
-            self.progress["value"] = 100
-            result = line[len("@DONE|"):]
-            self.log(f"Done: {result}")
-            messagebox.showinfo("Complete", f"Alignment finished.\n\nZip saved to:\n{result}")
-            self._set_busy(False)
-        elif line.startswith("@ERROR|"):
-            self._done_received = True
-            self._set_progress_indeterminate(False)
-            msg = line[len("@ERROR|"):]
-            self.log(f"ERROR: {msg}")
-            messagebox.showerror("Error", msg)
-            self._set_busy(False)
-        elif line.strip():
-            self.log(line)
-
-    def _set_progress_indeterminate(self, on: bool) -> None:
-        currently_on = str(self.progress.cget("mode")) == "indeterminate"
-        if on and not currently_on:
-            self.progress.configure(mode="indeterminate")
-            self.progress.start(15)
-        elif not on and currently_on:
-            self.progress.stop()
-            self.progress.configure(mode="determinate")
-
-    def _set_busy(self, busy: bool) -> None:
-        self._busy = busy
-        self._done_received = False
-        state = "disabled" if busy else "normal"
-        for widget in (self.btn_begin, self.btn_download):
-            widget.configure(state=state)
-        if busy:
-            self._set_progress_indeterminate(False)
-            self.progress["value"] = 0
-            self.log("---")
-            self.log("Working…")
+    def _copy_command(self) -> None:
+        if not self._run_command:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self._run_command)
 
     # ------------------------------------------------------------ logging
     def log(self, msg: str) -> None:
@@ -643,7 +551,7 @@ def _configure_unicode_fonts(root: tk.Tk) -> None:
     except tk.TclError:
         return
 
-    def pick(preferred: list[str]) -> str | None:
+    def pick(preferred: list[str]) -> "str | None":
         return next((f for f in preferred if f in available), None)
 
     ui_family = pick([
