@@ -107,8 +107,32 @@ if (-not $SkipRuntime) {
     if ($LASTEXITCODE -ne 0) { throw "tar extract failed" }
 
     # ---- verify ------------------------------------------------------------
-    & (Join-Path $runtimeDest "python.exe") -c "import montreal_forced_aligner, kalpy; print('runtime ok:', montreal_forced_aligner.__version__)"
-    if ($LASTEXITCODE -ne 0) { throw "runtime verification failed" }
+    # Invoking python.exe directly here (not through conda's own activate.bat)
+    # means native extensions that dlopen a DLL by name -- e.g. `soundfile`
+    # loading libsndfile.dll -- can fail even though libsndfile.dll is right
+    # there in Library\bin: the failure is actually one of libsndfile's OWN
+    # transitive dependencies (mingw runtime DLLs etc.) not being found,
+    # surfacing as "cannot load library 'libsndfile.dll': error 0x7e". A
+    # normal conda activation fixes this by putting Library\bin and
+    # Library\mingw-w64\bin on PATH; conda-pack's relocated env never gets
+    # that activation, so we do the same PATH prepend here that gui.py's
+    # _runtime_env() applies when the GUI spawns the real worker process --
+    # without it, this verification step can fail even on a build that would
+    # otherwise work fine once the app actually runs it.
+    $verifyBinDirs = @(
+        (Join-Path $runtimeDest "Library\mingw-w64\bin"),
+        (Join-Path $runtimeDest "Library\bin"),
+        (Join-Path $runtimeDest "Scripts"),
+        $runtimeDest
+    )
+    $prevPath = $env:PATH
+    $env:PATH = ($verifyBinDirs -join ";") + ";" + $prevPath
+    try {
+        & (Join-Path $runtimeDest "python.exe") -c "import montreal_forced_aligner, kalpy; print('runtime ok:', montreal_forced_aligner.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "runtime verification failed" }
+    } finally {
+        $env:PATH = $prevPath
+    }
 }
 
 Write-Step "Done"
