@@ -47,7 +47,22 @@ if (-not $SkipGui) {
     # attempt (e.g. before this check existed) would otherwise keep being
     # silently reused forever.
     function Test-Tkinter($pythonExe) {
-        & $pythonExe -c "import tkinter" 2>$null
+        # $ErrorActionPreference = "Stop" (set at the top of this script) makes
+        # PowerShell treat ANY stderr write from a native command as a
+        # terminating exception -- even one redirected with 2>$null, in some
+        # PowerShell versions/hosts the redirect doesn't fully suppress the
+        # escalation. python -c "import tkinter" on a broken install writes
+        # exactly that (an ImportError traceback to stderr), which is why this
+        # check itself was aborting the whole script instead of returning
+        # $false like it's supposed to. Flip to "Continue" for just this call
+        # so we can inspect $LASTEXITCODE ourselves instead.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $pythonExe -c "import tkinter" 2>$null 1>$null
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
         return $LASTEXITCODE -eq 0
     }
 
@@ -97,7 +112,13 @@ if (-not $SkipGui) {
     # does NOT exercise this (it never imports app.gui / tkinter at all), so
     # this uses the dedicated --selftest mode instead, which imports app.gui
     # without opening a window.
-    $selftest = & (Join-Path $dist "Auto-MFA.exe") --selftest 2>&1
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $selftest = & (Join-Path $dist "Auto-MFA.exe") --selftest 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     if ($LASTEXITCODE -ne 0 -or $selftest -notmatch "selftest ok") {
         throw ("Auto-MFA.exe --selftest failed after build (tkinter likely " +
             "missing from the frozen exe despite the build Python having it -- " +
@@ -184,10 +205,18 @@ if (-not $SkipRuntime) {
     )
     $prevPath = $env:PATH
     $env:PATH = ($verifyBinDirs -join ";") + ";" + $prevPath
+    # Also guard against the same stderr-becomes-terminating-error gotcha
+    # documented in Test-Tkinter above: if this import ever fails, python
+    # writes a traceback to stderr, which $ErrorActionPreference = "Stop"
+    # would otherwise turn into an opaque NativeCommandError instead of the
+    # clear "runtime verification failed" message below.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     try {
         & (Join-Path $runtimeDest "python.exe") -c "import montreal_forced_aligner, kalpy; print('runtime ok:', montreal_forced_aligner.__version__)"
         if ($LASTEXITCODE -ne 0) { throw "runtime verification failed" }
     } finally {
+        $ErrorActionPreference = $prevEAP
         $env:PATH = $prevPath
     }
 }
