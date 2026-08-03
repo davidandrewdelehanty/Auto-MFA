@@ -39,6 +39,42 @@ function Expand-Runtime([string]$TarPath, [string]$Dest) {
     if ($LASTEXITCODE -ne 0) { throw "tar extract failed" }
 }
 
+# Run a native command that is EXPECTED to sometimes write to stderr (a
+# warning, "nothing to remove", etc.) without the script-wide
+# $ErrorActionPreference = "Stop" turning that stderr write into a fatal
+# terminating error -- which is what a bare `2>$null` does NOT prevent: the
+# escalation to a NativeCommandError happens before the redirect ever gets a
+# chance to swallow it. Defined at top level (not nested in the GUI section)
+# because both the GUI and the runtime sections need it, and the runtime
+# section can run on its own via -SkipGui.
+function Invoke-Probe([scriptblock]$block) {
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $block } finally { $ErrorActionPreference = $prevEAP }
+}
+
+# PyInstaller's COLLECT step deletes and rebuilds the whole dist\Auto-MFA
+# folder on every GUI build. If Auto-MFA.exe (or a worker subprocess it
+# spawned -- those run runtime\python.exe, also under dist\Auto-MFA) is
+# still running, Windows keeps its DLLs locked and the delete fails partway
+# through with "Access is denied", leaving dist\Auto-MFA half-deleted.
+# Close anything still running from under dist\Auto-MFA before rebuilding.
+function Stop-DistProcesses([string]$DistPath) {
+    $victims = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            $_.ExecutablePath.StartsWith($DistPath, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    if ($victims) {
+        Write-Step "Stopping running Auto-MFA process(es) so dist\ can be rebuilt"
+        foreach ($v in $victims) {
+            Write-Host "  killing PID $($v.ProcessId): $($v.ExecutablePath)"
+            Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
 # Refresh the `app` package inside the runtime from the source tree.
 #
 # This matters more than it looks: the GUI shell exe does NOT run the
@@ -90,14 +126,6 @@ if (-not $SkipGui) {
             $ErrorActionPreference = $prevEAP
         }
         return $LASTEXITCODE -eq 0
-    }
-
-    # Run a native command that is EXPECTED to sometimes fail, without the
-    # script-wide "Stop" preference turning its stderr into a fatal error.
-    function Invoke-Probe([scriptblock]$block) {
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try { & $block } finally { $ErrorActionPreference = $prevEAP }
     }
 
     # Every Python this machine has, as absolute paths to python.exe.
@@ -171,6 +199,13 @@ if (-not $SkipGui) {
     & $venvPy -m pip install --quiet --upgrade pip
     & $venvPy -m pip install --quiet pyinstaller
     if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed" }
+
+    # See Stop-DistProcesses above: PyInstaller's COLLECT step is about to
+    # delete the whole dist\Auto-MFA folder, which fails with "Access is
+    # denied" on a locked DLL if Auto-MFA.exe (or a worker it spawned) is
+    # still running from a previous test.
+    Stop-DistProcesses $dist
+
     & $venvPy -m PyInstaller Auto-MFA.spec --noconfirm --clean
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (see Auto-MFA.spec)" }
 
@@ -212,16 +247,24 @@ if (-not $SkipRuntime) {
     # The local build conda must not depend on Anaconda's commercial "defaults"
     # channels (they require ToS acceptance).  Configure it to use conda-forge
     # only and accept the ToS in case those channels are still referenced.
+    #
+    # Every one of these calls is wrapped in Invoke-Probe: `conda config
+    # --remove channels defaults` (and friends) write a harmless message to
+    # stderr when there's nothing to do -- e.g. re-running this after
+    # "defaults" was already removed on a previous run -- and a bare
+    # `2>$null` does NOT stop $ErrorActionPreference = "Stop" from turning
+    # that stderr write into a terminating NativeCommandError first. Without
+    # this, the script died here on every run after the first.
     Write-Step "Configuring conda (conda-forge only)"
-    & $condaExe config --set auto_update_conda false 2>$null | Out-Null
-    & $condaExe config --remove channels defaults 2>$null | Out-Null
-    & $condaExe config --add channels conda-forge 2>$null | Out-Null
-    & $condaExe config --set channel_priority strict 2>$null | Out-Null
+    Invoke-Probe { & $condaExe config --set auto_update_conda false 2>$null | Out-Null }
+    Invoke-Probe { & $condaExe config --remove channels defaults 2>$null | Out-Null }
+    Invoke-Probe { & $condaExe config --add channels conda-forge 2>$null | Out-Null }
+    Invoke-Probe { & $condaExe config --set channel_priority strict 2>$null | Out-Null }
     foreach ($ch in @(
             "https://repo.anaconda.com/pkgs/main",
             "https://repo.anaconda.com/pkgs/r",
             "https://repo.anaconda.com/pkgs/msys2")) {
-        & $condaExe tos accept --override-channels --channel $ch 2>$null | Out-Null
+        Invoke-Probe { & $condaExe tos accept --override-channels --channel $ch 2>$null | Out-Null }
     }
 
     # ---- create env ------------------------------------------------------
