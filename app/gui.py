@@ -514,5 +514,23 @@ def launch() -> None:
         style.configure("Accent.TButton", font=("Segoe UI", 11, "bold"))
     except tk.TclError:
         pass
+    try:
+        # On some Windows machines the "vista" ttk theme fails to set a
+        # visible foreground color for Entry widgets specifically (Button
+        # and Listbox render fine), so bound text is present but invisible.
+        # Force explicit, known-good colors regardless of theme quirks.
+        style.configure(
+            "TEntry",
+            foreground="black",
+            fieldbackground="white",
+            insertcolor="black",
+        )
+        style.map(
+            "TEntry",
+            foreground=[("disabled", "#666666")],
+            fieldbackground=[("disabled", "#e0e0e0")],
+        )
+    except tk.TclError:
+        pass
     app = AutoMfaApp()
     app.mainloop()

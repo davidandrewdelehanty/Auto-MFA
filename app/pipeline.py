@@ -126,16 +126,28 @@ def _raw_wav_path(work_dir: Path, idx: int, pair: Pair) -> Path:
 
 
 def invoke_mfa(args: List[str], log: LogFn) -> int:
-    """Invoke the MFA CLI inside the current (worker) process."""
+    """Invoke the MFA CLI inside the current (worker) process.
+
+    IMPORTANT: this must call ``mfa_cli.main(..., standalone_mode=False)``,
+    never bare ``mfa_cli(args)``. click.Group/Command's default
+    ``standalone_mode=True`` makes Click call ``sys.exit()`` itself after
+    ANY command finishes -- success or failure. ``SystemExit`` is a
+    BaseException, not an Exception, so it silently escapes the
+    ``except Exception`` handler in worker.py's cmd_align() and kills the
+    entire worker process right after the first ``mfa`` subcommand
+    completes (e.g. right after a model download), with no error and no
+    further pipeline steps ever running. standalone_mode=False makes Click
+    return the command's result/exit code to us instead of exiting, so we
+    can check it and keep going.
+    """
     log("> mfa " + " ".join(args))
     try:
         from montreal_forced_aligner.command_line.mfa import mfa_cli
     except ImportError:
         from montreal_forced_aligner.command_line.mfa import main as mfa_cli
-    try:
-        mfa_cli(args)  # click.Group is callable with a list of argv
-    except TypeError:
-        mfa_cli.main(args, prog_name="mfa")
+    result = mfa_cli.main(args, prog_name="mfa", standalone_mode=False)
+    if isinstance(result, int) and result != 0:
+        raise RuntimeError(f"mfa {' '.join(args)} failed (exit code {result})")
     return 0
 
 
