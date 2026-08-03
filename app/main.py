@@ -29,6 +29,16 @@ def main() -> int:
     if argv and argv[0] == "--worker":
         from app import worker
         return worker.main(argv)
+    if argv and argv[0] == "--selftest":
+        # Used by build.ps1 right after packaging the GUI shell, to verify
+        # the frozen exe actually has a working tkinter bundled: importing
+        # app.gui exercises the same `import tkinter` a real launch hits,
+        # without opening a window or calling mainloop(). See the tkinter
+        # checks in build.ps1 for why this needs checking explicitly --
+        # PyInstaller can silently omit tkinter instead of failing the build.
+        from app import gui  # noqa: F401
+        print("selftest ok")
+        return 0
     from app import gui
     gui.launch()
     return 0

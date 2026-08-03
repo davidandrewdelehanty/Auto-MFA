@@ -35,17 +35,74 @@ function Write-Step($msg) { Write-Host "`n=== $msg" -ForegroundColor Cyan }
 # ---------------------------------------------------------------- GUI shell
 if (-not $SkipGui) {
     Write-Step "Building GUI shell ($dist\Auto-MFA.exe)"
+
+    # gui.py is a Tkinter app, but PyInstaller can only bundle tkinter if the
+    # Python building it actually HAS a working tkinter -- some Python
+    # installs (a "customize install" with the tcl/tk component unchecked,
+    # some minimal/embeddable builds) don't. When that happens PyInstaller
+    # does NOT fail the build; it just silently produces an exe that dies at
+    # launch with "ModuleNotFoundError: No module named 'tkinter'". Catch it
+    # here instead, before wasting a build on it -- and check EVERY run, not
+    # just when creating a fresh venv, since a stale `.venv` from an earlier
+    # attempt (e.g. before this check existed) would otherwise keep being
+    # silently reused forever.
+    function Test-Tkinter($pythonExe) {
+        & $pythonExe -c "import tkinter" 2>$null
+        return $LASTEXITCODE -eq 0
+    }
+
     if (-not (Test-Path $venvPy)) {
         $py = (py -$PythonVersion -c "import sys; print(sys.executable)" 2>$null).Trim()
         if (-not $py) { throw "Python $PythonVersion not found. Run 'py -0p' to list versions." }
+        if (-not (Test-Tkinter $py)) {
+            throw ("Python at '$py' has no working tkinter, so it can't build a Tkinter " +
+                "GUI. Fix: reinstall Python $PythonVersion from https://python.org (the " +
+                "default installer includes 'tcl/tk and IDLE' -- just don't uncheck it " +
+                "under Optional Features), or run 'py -0p' to see what else is installed " +
+                "and pass a different one via -PythonVersion.")
+        }
         & $py -m venv (Join-Path $root ".venv")
         if ($LASTEXITCODE -ne 0) { throw "Failed to create venv" }
     }
+
+    if (-not (Test-Tkinter $venvPy)) {
+        Write-Step "Existing .venv has no working tkinter -- recreating it"
+        Remove-Item -Recurse -Force (Join-Path $root ".venv") -ErrorAction SilentlyContinue
+        $py = (py -$PythonVersion -c "import sys; print(sys.executable)" 2>$null).Trim()
+        if (-not $py) { throw "Python $PythonVersion not found. Run 'py -0p' to list versions." }
+        if (-not (Test-Tkinter $py)) {
+            throw ("Python at '$py' has no working tkinter, so it can't build a Tkinter " +
+                "GUI. Fix: reinstall Python $PythonVersion from https://python.org (the " +
+                "default installer includes 'tcl/tk and IDLE' -- just don't uncheck it " +
+                "under Optional Features), or run 'py -0p' to see what else is installed " +
+                "and pass a different one via -PythonVersion.")
+        }
+        & $py -m venv (Join-Path $root ".venv")
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create venv" }
+        if (-not (Test-Tkinter $venvPy)) {
+            throw "Recreated .venv still has no working tkinter -- something is wrong with this Python install."
+        }
+    }
+
     & $venvPy -m pip install --quiet --upgrade pip
     & $venvPy -m pip install --quiet pyinstaller
     if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed" }
     & $venvPy -m PyInstaller Auto-MFA.spec --noconfirm --clean
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (see Auto-MFA.spec)" }
+
+    # Belt-and-suspenders: also verify the FROZEN exe actually has tkinter,
+    # so a PyInstaller-side gap (not just a source-Python gap -- e.g. a hook
+    # issue, or something quarantined by antivirus after the build) is caught
+    # here too instead of surfacing as a launch crash later. --worker mode
+    # does NOT exercise this (it never imports app.gui / tkinter at all), so
+    # this uses the dedicated --selftest mode instead, which imports app.gui
+    # without opening a window.
+    $selftest = & (Join-Path $dist "Auto-MFA.exe") --selftest 2>&1
+    if ($LASTEXITCODE -ne 0 -or $selftest -notmatch "selftest ok") {
+        throw ("Auto-MFA.exe --selftest failed after build (tkinter likely " +
+            "missing from the frozen exe despite the build Python having it -- " +
+            "see output above). Output: $selftest")
+    }
 }
 
 # ------------------------------------------------------------ MFA runtime
