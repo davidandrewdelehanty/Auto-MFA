@@ -47,7 +47,9 @@ def cmd_align(args: List[str]) -> int:
         return _fail("usage: worker align <jobfile.json>")
     job = json.loads(Path(args[0]).read_text(encoding="utf-8"))
     pairs = [
-        Pair(Path(p["audio"]), p.get("title", ""), p["text"])
+        Pair(Path(p["audio"]), p.get("title", ""), p["text"],
+             sub_chapters=[tuple(sc) for sc in p["sub_chapters"]]
+             if p.get("sub_chapters") else None)
         for p in job["pairs"]
     ]
     if not pairs:

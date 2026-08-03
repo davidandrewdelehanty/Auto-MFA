@@ -13,6 +13,15 @@ resulting word/phone alignments as one JSON file per audio track inside a zip.
    to positionally pair audio[i] with chapter[i] in one click — handy for a
    book with hundreds of chapters that are already in the same order as the
    audio files.
+   - **One big audio file covering several chapters** (a "whole book" or
+     "whole volume" recording, instead of one file per chapter) is also
+     supported: select a *contiguous* range of chapters in the chapter list
+     (click-drag, or click + shift-click) before pairing. The pipeline
+     figures out exactly where each chapter starts by how far through that
+     one audio file its words land (using the alignment's own output, not a
+     guess), then physically cuts the audio into one clip per chapter. Those
+     cut clips ship inside the output zip alongside their JSONs, since
+     nothing like them exists elsewhere yet.
 3. Press **BEGIN**.
 4. The app:
    - converts each audio file to a 16 kHz mono WAV (via bundled `ffmpeg`),
@@ -50,6 +59,37 @@ resulting word/phone alignments as one JSON file per audio track inside a zip.
 ```
 
 Empty intervals (silence) are omitted.
+
+## Multiple languages (French/German/English passages)
+
+Russian classics (War and Peace especially) often have paragraphs or whole
+pages of untranslated French, and sometimes German or English. MFA does
+**not** support aligning genuinely mixed-language audio accurately in one
+pass: alignment uses one acoustic model per run, trained on one language's
+phone inventory, and there's no supported way to swap models mid-utterance.
+MFA's "speaker dictionaries" feature maps different *speakers* to different
+dictionaries (for multi-speaker corpora with dialect variation) — it doesn't
+apply to a single narrator switching languages within their own speech, and
+even MFA's own multilingual-IPA mode (approximating phone sets across
+related languages/dialects to share one acoustic model) is documented by
+MFA's author as giving only slight gains, for languages far more similar to
+each other than Russian is to French. The realistic, supported path — align
+each language's audio separately, once you already know where it falls in
+the recording — is a chicken-and-egg problem for a first-time alignment:
+you don't know where the French passage falls in the audio until you've
+already aligned something.
+
+What Auto-MFA does today: foreign-script (Latin-alphabet) words are kept as
+literal tokens in the transcript and left to the Russian g2p model to guess
+a pronunciation for, the same as any other out-of-dictionary word (see
+*Out-of-dictionary words* below). This keeps a French/German/English passage
+from derailing the words around it, but word-level timing *within* that
+passage will be less accurate than for the surrounding Russian text — worth
+knowing if a chapter is heavy with untranslated foreign dialogue. A proper
+fix (coarse pass with the Russian model to locate the foreign span, then a
+second refinement pass on just that span with the matching French/German/
+English model) is a real, buildable feature, just a meaningfully bigger one
+than a first cut — flag it if it's worth the effort for your books.
 
 ## What is bundled
 

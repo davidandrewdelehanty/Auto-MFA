@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import audio as audio_mod
 from . import chunking
@@ -27,6 +27,16 @@ class Pair:
     audio: Path
     title: str
     text: str
+    # Set when one audio file spans several consecutive original chapters at
+    # once (e.g. a single "whole book" or "whole volume" recording) instead
+    # of the usual one-file-per-chapter case. `text` above is still the full
+    # concatenated transcript for the whole `audio` file -- prepare_corpus
+    # doesn't need to know anything changed. Each entry is (title, word_count)
+    # for one constituent chapter, in the same order they were concatenated
+    # into `text`; postprocess() uses the word counts to split the alignment
+    # back into one result (and one cut audio clip) per original chapter. None
+    # for the ordinary one-file-per-chapter case.
+    sub_chapters: Optional[List[Tuple[str, int]]] = None
 
 
 @dataclass
@@ -101,6 +111,20 @@ def ensure_models(acoustic: str, dictionary: str, auto_download: bool,
                 f"dictionary (character names, etc.) will not align.")
 
 
+def _pair_stem(idx: int, pair: Pair) -> str:
+    return f"{idx:03d}_{audio_mod.safe_stem(pair.audio.name)}"
+
+
+def _raw_wav_path(work_dir: Path, idx: int, pair: Pair) -> Path:
+    """Where prepare_corpus put this pair's full-length converted WAV.
+
+    postprocess() needs this (only for pairs with sub_chapters) to cut
+    per-chapter audio clips after alignment; work_dir isn't cleaned up until
+    after write_zip runs, so the file is still there when this is called.
+    """
+    return work_dir / "raw" / f"{_pair_stem(idx, pair)}.wav"
+
+
 def invoke_mfa(args: List[str], log: LogFn) -> int:
     """Invoke the MFA CLI inside the current (worker) process."""
     log("> mfa " + " ".join(args))
@@ -141,7 +165,7 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
     total = len(pairs)
     for idx, pair in enumerate(pairs):
         log(f"[{idx + 1}/{total}] Preparing '{pair.audio.name}'")
-        stem = f"{idx:03d}_{audio_mod.safe_stem(pair.audio.name)}"
+        stem = _pair_stem(idx, pair)
         raw_wav = raw_dir / f"{stem}.wav"
         audio_mod.convert_to_wav(str(pair.audio), str(raw_wav), ffmpeg)
 
@@ -221,9 +245,120 @@ def _shift(tiers: Dict[str, List[Dict]], offset: float) -> Dict[str, List[Dict]]
     return out
 
 
+def _split_pair_into_chapters(pair: Pair, pair_idx: int, words: List[Dict],
+                              phones: List[Dict], duration: float,
+                              work_dir: Optional[Path], ffmpeg: Optional[str],
+                              log: LogFn) -> List[Dict]:
+    """Split one multi-chapter pair's merged alignment into one result (and,
+    if possible, one cut audio clip) per original chapter.
+
+    Boundaries are chosen from the EXACT word counts of each constituent
+    chapter (known precisely -- we concatenated the transcript from them
+    ourselves), not estimated proportionally the way segment.py divides a
+    single chapter's text across silence-snapped utterances. If the aligned
+    word count doesn't match what was expected (MFA dropped or merged a
+    word somewhere -- rare, but possible for pathological OOV cases), this
+    falls back to a proportional split scaled to the actual count instead of
+    crashing, and says so in the log.
+    """
+    sub_chapters = pair.sub_chapters or []
+    expected_total = sum(wc for _, wc in sub_chapters)
+    n = len(sub_chapters)
+
+    bounds = [0]
+    cum = 0
+    if expected_total == len(words):
+        for _, wc in sub_chapters[:-1]:
+            cum += wc
+            bounds.append(cum)
+    else:
+        log(f"  Warning: expected {expected_total} words across {n} chapters "
+            f"but alignment produced {len(words)} for '{pair.audio.name}'; "
+            f"falling back to a proportional split (chapter boundaries may "
+            f"be slightly off).")
+        for _, wc in sub_chapters[:-1]:
+            cum += wc
+            bounds.append(round(cum / expected_total * len(words)) if expected_total else 0)
+    bounds.append(len(words))
+    for i in range(1, len(bounds)):
+        if bounds[i] < bounds[i - 1]:
+            bounds[i] = bounds[i - 1]
+
+    # Cut points in time: the midpoint between the last word of one chapter
+    # and the first word of the next, so a cut lands in whatever pause is
+    # there rather than mid-word. Falls back sensibly if a chapter ended up
+    # with zero words (e.g. from a lopsided proportional split above).
+    cut_points = [0.0]
+    for k in range(1, n):
+        w_before = words[bounds[k] - 1] if bounds[k] > 0 else None
+        w_after = words[bounds[k]] if bounds[k] < len(words) else None
+        if w_before and w_after:
+            cut_points.append((w_before["end"] + w_after["start"]) / 2.0)
+        elif w_after:
+            cut_points.append(w_after["start"])
+        elif w_before:
+            cut_points.append(w_before["end"])
+        else:
+            cut_points.append(cut_points[-1])
+    cut_points.append(duration)
+
+    raw_wav = None
+    if work_dir is not None and ffmpeg:
+        candidate = _raw_wav_path(Path(work_dir), pair_idx, pair)
+        if candidate.exists():
+            raw_wav = candidate
+        else:
+            log(f"  Warning: source audio for '{pair.audio.name}' not found "
+                f"at {candidate}; cannot cut per-chapter audio clips (JSON "
+                f"timings will still be produced).")
+
+    base_stem = audio_mod.safe_stem(pair.audio.stem)
+    out: List[Dict] = []
+    for k, (title, _wc) in enumerate(sub_chapters):
+        w_slice = words[bounds[k]:bounds[k + 1]]
+        start_t, end_t = cut_points[k], cut_points[k + 1]
+        p_slice = [p for p in phones if start_t <= p["start"] < end_t]
+        rebased_words = [
+            {"start": round(w["start"] - start_t, 6),
+             "end": round(w["end"] - start_t, 6), "text": w["text"]}
+            for w in w_slice
+        ]
+        rebased_phones = [
+            {"start": round(p["start"] - start_t, 6),
+             "end": round(p["end"] - start_t, 6), "text": p["text"]}
+            for p in p_slice
+        ]
+        chapter_audio_name = f"{base_stem}_ch{k + 1:03d}.mp3"
+        result: Dict = {
+            "audio_file": chapter_audio_name,
+            "title": title,
+            "duration": round(end_t - start_t, 6),
+            "words": rebased_words,
+            "phones": rebased_phones,
+        }
+        if raw_wav is not None:
+            clip_path = Path(work_dir) / "chapters" / chapter_audio_name
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                segment_mod.cut_segment_mp3(
+                    ffmpeg, str(raw_wav), str(clip_path), start_t, end_t - start_t)
+                result["_audio_path"] = str(clip_path)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  Warning: failed to cut chapter audio for '{title}' "
+                    f"({exc}); JSON will still be produced.")
+        out.append(result)
+        log(f"  Split '{pair.audio.name}' chapter {k + 1}/{n} '{title}' "
+            f"({end_t - start_t:.2f}s)")
+    return out
+
+
 def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
-                log: LogFn) -> List[Dict]:
-    """Combine per-segment TextGrids back into one JSON dict per audio pair."""
+                log: LogFn, work_dir: Optional[Path] = None,
+                ffmpeg: Optional[str] = None) -> List[Dict]:
+    """Combine per-segment TextGrids back into one JSON dict per audio pair
+    (or, for a pair spanning multiple original chapters, one JSON dict --
+    and one cut audio clip, if *work_dir*/*ffmpeg* are given -- per chapter).
+    """
     by_pair: Dict[int, List[CorpusJob]] = {}
     for job in jobs:
         by_pair.setdefault(job.pair_index, []).append(job)
@@ -262,6 +397,12 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
 
         words = [i for i in tiers.get("words", []) if i["text"]]
         phones = [i for i in tiers.get("phones", []) if i["text"]]
+
+        if pair.sub_chapters:
+            results.extend(_split_pair_into_chapters(
+                pair, pair_idx, words, phones, duration, work_dir, ffmpeg, log))
+            continue
+
         result = {
             "audio_file": pair.audio.name,
             "title": pair.title,
@@ -285,7 +426,16 @@ def write_zip(results: List[Dict], output_dir: Path, zip_path: Path,
         for result in results:
             stem = Path(result["audio_file"]).stem
             json_name = f"{stem}.json"
+            # Only set for chapters split out of a multi-chapter pair (see
+            # postprocess/_split_pair_into_chapters): those chapters have no
+            # pre-existing standalone audio file anywhere else, so the cut
+            # clip has to ship in this zip alongside its JSON. An ordinary
+            # one-file-per-chapter pair has none of this -- its source audio
+            # already exists as the user's own file, unchanged.
+            audio_path = result.pop("_audio_path", None)
             zf.writestr(json_name, json.dumps(result, ensure_ascii=False, indent=2))
+            if audio_path and Path(audio_path).exists():
+                zf.write(audio_path, arcname=result["audio_file"])
     log(f"Wrote {zip_path}")
     return zip_path
 
@@ -320,7 +470,8 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
                      log, num_jobs=num_jobs)
         progress(0.9, "building JSON")
-        results = postprocess(alignment_dir, pairs, jobs, log)
+        results = postprocess(alignment_dir, pairs, jobs, log,
+                              work_dir=work_dir, ffmpeg=ffmpeg)
         if not results:
             raise RuntimeError("Alignment produced no output.")
         zip_path = output_dir / (zip_name or default_zip_name(output_dir))

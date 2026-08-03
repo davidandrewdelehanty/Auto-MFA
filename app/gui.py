@@ -36,7 +36,11 @@ class AutoMfaApp(tk.Tk):
 
         self.chapters = []
         self.audio_files: list[Path] = []
-        self.pairs: list[tuple[int, int]] = []
+        # Each pair is (audio_idx, chapter_idxs) where chapter_idxs is a
+        # tuple of one or more chapter indices -- more than one means this
+        # single audio file spans that whole (contiguous) run of chapters,
+        # e.g. a "whole book" recording; see _pair_selected / _build_job.
+        self.pairs: list[tuple[int, tuple[int, ...]]] = []
         self._busy = False
         self._proc = None
         self._msg_queue: "queue.Queue[str]" = queue.Queue()
@@ -77,7 +81,8 @@ class AutoMfaApp(tk.Tk):
         ttk.Button(middle, text="◀ Unpair", command=self._remove_selected_pair).pack(pady=4)
         ttk.Button(middle, text="Auto-pair\nin order", command=self._auto_pair).pack(pady=4)
         self.chapter_list = self._make_listbox(
-            pairing, "FB2 chapters", 2)
+            pairing, "FB2 chapters (select a range to pair many to one file)", 2,
+            selectmode="extended")
 
         # Pairs summary
         pairs_frame = ttk.LabelFrame(root, text="Pairs (audio ⇄ chapter)", padding=4)
@@ -144,12 +149,13 @@ class AutoMfaApp(tk.Tk):
         self.log_text.configure(yscrollcommand=log_sb.set)
         root.rowconfigure(6, weight=3)
 
-    def _make_listbox(self, parent: ttk.Frame, label: str, col: int) -> tk.Listbox:
+    def _make_listbox(self, parent: ttk.Frame, label: str, col: int,
+                      selectmode: str = "browse") -> tk.Listbox:
         frame = ttk.LabelFrame(parent, text=label, padding=4)
         frame.grid(row=0, column=col, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        lb = tk.Listbox(frame, height=8, exportselection=False)
+        lb = tk.Listbox(frame, height=8, exportselection=False, selectmode=selectmode)
         lb.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(frame, command=lb.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -196,18 +202,38 @@ class AutoMfaApp(tk.Tk):
 
     def _pair_selected(self) -> None:
         audio_sel = self.audio_list.curselection()
-        chapter_sel = self.chapter_list.curselection()
+        chapter_sel = sorted(self.chapter_list.curselection())
         if not audio_sel or not chapter_sel:
-            messagebox.showinfo("Pair", "Select one audio file and one chapter first.")
+            messagebox.showinfo(
+                "Pair", "Select one audio file and one or more chapters first.")
             return
-        audio_idx, chapter_idx = audio_sel[0], chapter_sel[0]
+        audio_idx = audio_sel[0]
         if any(a == audio_idx for a, _ in self.pairs):
             messagebox.showinfo(
                 "Already paired",
                 f"'{self.audio_files[audio_idx].name}' is already paired. "
                 "Unpair it first to change the mapping.")
             return
-        self.pairs.append((audio_idx, chapter_idx))
+        # A single audio file can be paired to a whole RUN of chapters (one
+        # big recording spanning several chapters at once), but only if that
+        # run is contiguous and in order -- the pipeline figures out where
+        # each chapter starts by how far through the audio its words land,
+        # which only makes sense for chapters read in that same order.
+        if chapter_sel != list(range(chapter_sel[0], chapter_sel[-1] + 1)):
+            messagebox.showerror(
+                "Non-contiguous selection",
+                "When pairing one audio file to multiple chapters, the "
+                "chapters must be a contiguous, in-order run (e.g. chapters "
+                "5-12). Select a single unbroken range.")
+            return
+        already_paired = {c for _, cs in self.pairs for c in cs}
+        if already_paired & set(chapter_sel):
+            messagebox.showinfo(
+                "Already paired",
+                "One or more of the selected chapters is already paired to "
+                "another audio file. Unpair it first to change the mapping.")
+            return
+        self.pairs.append((audio_idx, tuple(chapter_sel)))
         self._refresh_pairs()
         nxt = audio_idx + 1
         if nxt < len(self.audio_files):
@@ -230,7 +256,7 @@ class AutoMfaApp(tk.Tk):
                 f"Only the first {n} will be paired positionally (audio[i] ⇄ chapter[i]). "
                 "Continue?"):
                 return
-        self.pairs = [(i, i) for i in range(n)]
+        self.pairs = [(i, (i,)) for i in range(n)]
         self._refresh_pairs()
         self.log(f"Auto-paired {n} audio file(s) to chapter(s) in order.")
 
@@ -243,11 +269,15 @@ class AutoMfaApp(tk.Tk):
 
     def _refresh_pairs(self) -> None:
         self.pairs_list.delete(0, "end")
-        for audio_idx, chapter_idx in self.pairs:
+        for audio_idx, chapter_idxs in self.pairs:
+            if len(chapter_idxs) == 1:
+                label = self.chapters[chapter_idxs[0]]["title"]
+            else:
+                label = (f"{self.chapters[chapter_idxs[0]]['title']} .. "
+                         f"{self.chapters[chapter_idxs[-1]]['title']} "
+                         f"({len(chapter_idxs)} chapters)")
             self.pairs_list.insert(
-                "end",
-                f"{self.audio_files[audio_idx].name}  ⇄  "
-                f"{self.chapters[chapter_idx]['title']}")
+                "end", f"{self.audio_files[audio_idx].name}  ⇄  {label}")
 
     # --------------------------------------------------------- pipeline
     def _build_job(self) -> Path:
@@ -274,10 +304,22 @@ class AutoMfaApp(tk.Tk):
             "pairs": [
                 {
                     "audio": str(self.audio_files[a]),
-                    "title": self.chapters[c]["title"],
-                    "text": self.chapters[c]["text"],
+                    "title": (
+                        self.chapters[cs[0]]["title"] if len(cs) == 1
+                        else f"{self.chapters[cs[0]]['title']} - {self.chapters[cs[-1]]['title']}"
+                    ),
+                    "text": " ".join(self.chapters[c]["text"] for c in cs),
+                    # Only set for a multi-chapter pairing: (title, word_count)
+                    # per constituent chapter, in order -- lets the pipeline
+                    # split the alignment back into one result per chapter.
+                    # See Pair.sub_chapters in pipeline.py.
+                    "sub_chapters": (
+                        [[self.chapters[c]["title"], len(transcript_words(self.chapters[c]["text"]))]
+                         for c in cs]
+                        if len(cs) > 1 else None
+                    ),
                 }
-                for a, c in self.pairs
+                for a, cs in self.pairs
             ],
             "acoustic_model": self.acoustic_model.get().strip() or "russian_mfa",
             "dictionary": self.dictionary.get().strip() or "russian_mfa",

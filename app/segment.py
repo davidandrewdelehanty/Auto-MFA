@@ -165,3 +165,24 @@ def cut_segment(ffmpeg: str, src_wav: str, dst_wav: str, start: float, dur: floa
         cmd, check=True, capture_output=True, text=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+
+
+def cut_segment_mp3(ffmpeg: str, src_wav: str, dst_mp3: str, start: float, dur: float,
+                    bitrate: str = "96k") -> None:
+    """Like cut_segment, but encodes to mp3.
+
+    Used for final per-chapter audio deliverables (see pipeline.postprocess's
+    multi-chapter split, where one audio file spanning several chapters gets
+    physically cut back into one clip per chapter): a compact, shippable file
+    matters more there than raw PCM.
+    """
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.6f}", "-i", src_wav, "-t", f"{dur:.6f}",
+        "-c:a", "libmp3lame", "-b:a", bitrate,
+        dst_mp3,
+    ]
+    subprocess.run(
+        cmd, check=True, capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )

@@ -24,6 +24,7 @@ import zipfile
 from pathlib import Path
 
 from app.pipeline import CorpusJob, Pair, postprocess, prepare_corpus, write_zip
+from app import audio as audio_mod
 
 BYTES_PER_SEC = 32000  # 16 kHz 16-bit mono WAV
 
@@ -191,6 +192,118 @@ class PostprocessOffsetTest(unittest.TestCase):
 
             # Total reported duration is the sum of planned durations too.
             self.assertAlmostEqual(results[0]["duration"], sum(planned_durations), places=3)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not on PATH")
+class MultiChapterSplitTest(unittest.TestCase):
+    """One audio file spanning several original chapters at once (e.g. a
+    'whole book' recording) -- see Pair.sub_chapters and
+    pipeline._split_pair_into_chapters."""
+
+    def test_exact_word_count_split_and_cut_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            audio = root / "01.wav"
+            make_tone_wav(audio, 4.0)
+
+            work = root / "work"
+            work.mkdir()
+            words_a = ["один", "два", "три"]
+            words_b = ["четыре", "пять"]
+            pair = Pair(
+                audio=audio, title="Chapters A-B",
+                text=" ".join(words_a + words_b),
+                sub_chapters=[("Chapter A", len(words_a)), ("Chapter B", len(words_b))],
+            )
+
+            # A short, silence-free 4s clip stays a single segment (under the
+            # default 45s cap), so exactly one fake TextGrid is needed.
+            jobs = prepare_corpus([pair], work, log=print, progress=lambda *_: None)
+            self.assertEqual(len(jobs), 1)
+            self.assertAlmostEqual(jobs[0].duration, 4.0, places=3)
+
+            align = work / "alignment"
+            align.mkdir()
+            all_words = words_a + words_b
+            (align / f"{Path(jobs[0].wav).stem}.TextGrid").write_text(
+                fake_textgrid(all_words, step=0.6), encoding="utf-8")
+
+            ffmpeg = audio_mod.find_ffmpeg()
+            results = postprocess(align, [pair], jobs, log=print,
+                                  work_dir=work, ffmpeg=ffmpeg)
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0]["title"], "Chapter A")
+            self.assertEqual(results[1]["title"], "Chapter B")
+
+            # Word-for-word split (exact, from the known word counts): 3
+            # words in chapter A, 2 in chapter B, none dropped or duplicated.
+            self.assertEqual([w["text"] for w in results[0]["words"]], words_a)
+            self.assertEqual([w["text"] for w in results[1]["words"]], words_b)
+
+            # Each chapter's own words are rebased to start near 0 relative
+            # to ITS OWN cut clip, not the original combined-audio timeline.
+            self.assertAlmostEqual(results[0]["words"][0]["start"], 0.6, places=3)
+            self.assertLess(results[1]["words"][0]["start"], results[0]["words"][0]["start"] + 0.1)
+
+            # Durations are contiguous and sum back to the full pair duration.
+            self.assertAlmostEqual(
+                results[0]["duration"] + results[1]["duration"], 4.0, places=3)
+
+            # A cut mp3 clip was produced for each chapter, roughly the right length.
+            for result, expected_dur in zip(results, (results[0]["duration"], results[1]["duration"])):
+                clip = Path(result["_audio_path"])
+                self.assertTrue(clip.exists(), f"missing cut clip: {clip}")
+                actual_dur = float(subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(clip)],
+                    capture_output=True, text=True, check=True).stdout.strip())
+                self.assertAlmostEqual(actual_dur, expected_dur, delta=0.3)
+
+            # write_zip embeds both the JSON and the cut audio for each
+            # chapter, and strips the internal _audio_path bookkeeping key
+            # out of the JSON it writes.
+            out_dir = root / "out"
+            out_dir.mkdir()
+            zip_path = out_dir / "test.zip"
+            write_zip(results, out_dir, zip_path, log=print)
+            with zipfile.ZipFile(zip_path) as zf:
+                names = set(zf.namelist())
+                self.assertIn(results[0]["audio_file"], names)
+                self.assertIn(results[1]["audio_file"], names)
+                for r in results:
+                    stem = Path(r["audio_file"]).stem
+                    data = json.loads(zf.read(f"{stem}.json").decode("utf-8"))
+                    self.assertNotIn("_audio_path", data)
+
+    def test_word_count_mismatch_falls_back_without_crashing(self):
+        # No ffmpeg/work_dir needed here -- this only exercises the
+        # word-count bookkeeping and fallback path, not audio cutting.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            align = root / "alignment"
+            align.mkdir()
+            pair = Pair(
+                audio=root / "01.wav", title="Chapters A-B", text="",
+                sub_chapters=[("Chapter A", 3), ("Chapter B", 3)],  # expects 6
+            )
+            job = CorpusJob(pair_index=0, chunk_index=0,
+                            wav=str(root / "000_01_000.wav"),
+                            txt=str(root / "000_01_000.txt"), duration=4.0)
+            # Only 5 words actually come back from "alignment" (MFA dropped
+            # one) -- must not crash, and the 5 words must still all show up
+            # somewhere across the two chapters.
+            words = ["один", "два", "три", "четыре", "пять"]
+            (align / "000_01_000.TextGrid").write_text(
+                fake_textgrid(words, step=0.5), encoding="utf-8")
+
+            results = postprocess(align, [pair], [job], log=print)
+            self.assertEqual(len(results), 2)
+            total_words = sum(len(r["words"]) for r in results)
+            self.assertEqual(total_words, len(words))
+            # Order preserved, nothing duplicated.
+            seen = [w["text"] for r in results for w in r["words"]]
+            self.assertEqual(seen, words)
 
 
 if __name__ == "__main__":
