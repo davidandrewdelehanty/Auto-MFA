@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -63,6 +64,28 @@ class AutoMfaApp(tk.Tk):
             row=0, column=1, sticky="ew", padx=4)
         ttk.Button(top, text="Browse…", command=self._browse_folder).grid(
             row=0, column=2)
+
+        # This build runs MFA through Windows-native conda/kaldi binaries,
+        # which are meaningfully slower than the same alignment on Linux
+        # (Windows lacks fork(), pays CreateProcess overhead on every one of
+        # Kaldi's many short-lived subprocess calls, and unsigned freshly
+        # extracted binaries get real-time-scanned by Defender). Nudge
+        # people toward WSL, where this same app runs directly against a
+        # normal Linux conda env with none of that overhead -- only shown
+        # when actually running natively on Windows, not inside WSL itself.
+        if sys.platform == "win32":
+            wsl_hint = ttk.Label(
+                top,
+                text=("Running on Windows? Alignment is noticeably faster "
+                      "under WSL Ubuntu -- click for setup instructions"),
+                foreground="#0645AD", cursor="hand2",
+                font=("Segoe UI", 9, "underline"),
+            )
+            wsl_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+            wsl_hint.bind(
+                "<Button-1>",
+                lambda e: webbrowser.open("https://learn.microsoft.com/en-us/windows/wsl/install"),
+            )
 
         # Pairing panes
         pairing = ttk.Frame(root)
