@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import List
 
+from . import segment as segment_mod
 from .pipeline import Pair, ensure_models, model_present, run_pipeline
 
 
@@ -57,10 +58,12 @@ def cmd_align(args: List[str]) -> int:
             acoustic=job.get("acoustic_model", "russian_mfa"),
             dictionary=job.get("dictionary", "russian_mfa"),
             output_dir=Path(job["output_dir"]),
-            chunk_limit_bytes=job.get("chunk_limit_bytes", 2 * 1024 ** 3),
             zip_name=job.get("zip_name"),
             auto_download=job.get("auto_download", True),
             keep_temp=job.get("keep_temp", False),
+            num_jobs=job.get("num_jobs", 2),
+            target_seconds=job.get("target_seconds", segment_mod.DEFAULT_TARGET),
+            max_seconds=job.get("max_seconds", segment_mod.DEFAULT_MAX),
             log=_status,
             progress=_progress,
         )

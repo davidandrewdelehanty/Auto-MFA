@@ -55,11 +55,72 @@ def _section_title(section: ET.Element) -> str:
     return ""
 
 
+def _direct_text(section: ET.Element) -> str:
+    """Text from *section*'s own content only -- NOT descending into nested
+    <section> children (but still descending into wrapper elements like
+    <epigraph> or <poem> that hold their own <p>/<v> content, the same way
+    _collect_text does for a leaf section).
+
+    Used for a section that contains both its own content and nested
+    subsections (e.g. a "Part One" section with an epigraph before its first
+    nested chapter): that preamble becomes its own small chapter instead of
+    being silently dropped, without also re-collecting the nested
+    subsections' text (they are walked separately, as their own chapters).
+    """
+    parts: List[str] = []
+
+    def walk(elem: ET.Element) -> None:
+        for child in elem:
+            tag = _localname(child.tag)
+            if tag in ("section", "title"):
+                continue  # nested chapters, and the section's own title
+                          # (already captured separately by _section_title),
+                          # are excluded from the preamble text
+            if tag in ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td"):
+                text = "".join(child.itertext()).strip()
+                if text:
+                    parts.append(text)
+            else:
+                walk(child)  # descend into wrapper containers (epigraph, poem, ...)
+
+    walk(section)
+    return " ".join(parts)
+
+
+def _walk_sections(section: ET.Element, chapters: List[Dict[str, str]]) -> None:
+    """Depth-first: append one chapter per LEAF <section> (no nested
+    <section> children), in document order.
+
+    Real FB2 files vary in how deep they nest: some (already flattened for a
+    per-chapter audio pipeline) have one chapter per section directly under
+    <body>; many "raw" FB2s downloaded from a library instead nest a "Part"
+    section around each chapter's own section. Only descending into DIRECT
+    children of <body> -- as earlier versions of this function did -- treats
+    each Part as a single giant chapter, concatenating every chapter inside
+    it into one blob via _collect_text's full-subtree walk. Recursing to
+    leaves handles both shapes the same way, and changes nothing for a file
+    that was already flat (a section with no nested sections behaves exactly
+    as before).
+    """
+    nested = [c for c in section if _localname(c.tag) == "section"]
+    title = _section_title(section)
+    if not nested:
+        text = _collect_text(section).strip()
+        if text:
+            chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
+        return
+    preamble = _direct_text(section).strip()
+    if preamble:
+        chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": preamble})
+    for child in nested:
+        _walk_sections(child, chapters)
+
+
 def extract_chapters(path: Path) -> List[Dict[str, str]]:
     """Parse *path* and return [{title, text}, ...].
 
-    Only the main `body` is used; footnotes/comments bodies are skipped.  Each
-    top-level `section` becomes one chapter.
+    Only the main `body` is used; footnotes/comments bodies are skipped. Each
+    leaf `section` (recursively; see _walk_sections) becomes one chapter.
     """
     tree = ET.parse(path)
     root = tree.getroot()
@@ -73,10 +134,7 @@ def extract_chapters(path: Path) -> List[Dict[str, str]]:
         for section in body:
             if _localname(section.tag) != "section":
                 continue
-            title = _section_title(section)
-            text = _collect_text(section).strip()
-            if text:
-                chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
+            _walk_sections(section, chapters)
     if not chapters:
         raise ValueError(f"No chapters found in {path}")
     return chapters

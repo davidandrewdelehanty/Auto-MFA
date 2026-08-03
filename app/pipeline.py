@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import audio as audio_mod
 from . import chunking
+from . import segment as segment_mod
 from .fb2 import transcript_words, words_to_text
 from .textgrid import parse_textgrid
 
@@ -34,6 +35,11 @@ class CorpusJob:
     chunk_index: int
     wav: str
     txt: str
+    duration: float  # ground truth: exactly what we told ffmpeg to cut, in
+                      # seconds. Used to place this job's alignment at the
+                      # right offset in postprocess() -- see the comment there
+                      # for why this must NOT be inferred from MFA's own
+                      # output instead.
 
 
 def _null_log(msg: str) -> None:
@@ -81,12 +87,18 @@ def ensure_models(acoustic: str, dictionary: str, auto_download: bool,
                 f"models' or run the Download models button."
             )
         download_model(model_type, name, log)
-    # Optional G2P model helps with out-of-dictionary words. Best-effort only.
+    # G2P model: lets alignment cover words missing from the base dictionary
+    # (character names, foreign phrases, anything the dictionary's author
+    # didn't include) by generating a pronunciation for them on the fly,
+    # instead of silently failing to align those words at all. Best-effort:
+    # alignment still works without it, just worse on OOV-heavy text.
     if not model_present("g2p", dictionary):
         try:
             download_model("g2p", dictionary, log)
         except Exception as exc:  # noqa: BLE001
-            log(f"Note: could not fetch optional g2p model ({exc}).")
+            log(f"Note: could not fetch optional g2p model ({exc}). "
+                f"Alignment will proceed, but words missing from the "
+                f"dictionary (character names, etc.) will not align.")
 
 
 def invoke_mfa(args: List[str], log: LogFn) -> int:
@@ -103,13 +115,23 @@ def invoke_mfa(args: List[str], log: LogFn) -> int:
     return 0
 
 
-def prepare_corpus(pairs: List[Pair], work_dir: Path, chunk_limit_bytes: int,
-                   log: LogFn, progress: ProgressFn,
-                   ffmpeg: Optional[str] = None) -> List[CorpusJob]:
-    """Convert audio to 16 kHz WAV, chunk oversized files, write transcripts.
+def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
+                   progress: ProgressFn, ffmpeg: Optional[str] = None,
+                   target_seconds: float = segment_mod.DEFAULT_TARGET,
+                   max_seconds: float = segment_mod.DEFAULT_MAX) -> List[CorpusJob]:
+    """Convert audio to 16 kHz WAV and split every chapter into short,
+    silence-snapped utterances (see segment.py for why this always happens,
+    not just for oversized files).
 
-    Returns the list of corpus jobs (one per chunk / per pair).
+    Returns the list of corpus jobs (one per utterance / per pair).
     """
+    ffmpeg = ffmpeg or audio_mod.find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError(
+            "FFmpeg was not found. Install it and put ffmpeg.exe on PATH, or "
+            "re-run the build script so it is bundled next to the app."
+        )
+
     raw_dir = work_dir / "raw"
     corpus_dir = work_dir / "corpus"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -129,32 +151,39 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, chunk_limit_bytes: int,
             progress((idx + 1) / total, "skipped empty chapter")
             continue
 
-        size = raw_wav.stat().st_size
         duration = audio_mod.probe_duration(str(raw_wav))
-        plan = chunking.plan_chunks(duration, size, chunk_limit_bytes)
-        if plan.needs_chunking:
-            log(f"  Chunking into {plan.num_chunks} parts (audio is "
-                f"{size / (1024 ** 3):.2f} GiB).")
-            chunks = audio_mod.split_wav_by_duration(
-                str(raw_wav), str(corpus_dir), stem, plan.chunk_duration, ffmpeg
-            )
-            parts = chunking.partition_words(words, plan.num_chunks)
-            for c_i, chunk_wav in enumerate(chunks):
-                txt = corpus_dir / f"{Path(chunk_wav).stem}.txt"
-                txt.write_text(words_to_text(parts[c_i]), encoding="utf-8")
-                jobs.append(CorpusJob(idx, c_i, chunk_wav, str(txt)))
+        if duration <= 0:
+            log(f"  Warning: '{pair.audio.name}' has no measurable duration; skipping.")
+            progress((idx + 1) / total, "skipped unreadable audio")
+            continue
+
+        silences = segment_mod.detect_silences(str(raw_wav), ffmpeg, duration)
+        segs = segment_mod.plan_segments(duration, silences, target_seconds, max_seconds)
+        if len(segs) <= 1:
+            log(f"  {duration:.1f}s, one utterance (under the {max_seconds:.0f}s cap).")
         else:
-            wav = corpus_dir / f"{stem}.wav"
-            shutil.copy2(raw_wav, wav)
-            txt = corpus_dir / f"{stem}.txt"
-            txt.write_text(words_to_text(words), encoding="utf-8")
-            jobs.append(CorpusJob(idx, 0, str(wav), str(txt)))
+            snapped = sum(1 for s, e in silences
+                          for seg in segs if abs(seg.end - (s + e) / 2.0) < 0.02)
+            log(f"  {duration:.1f}s -> {len(segs)} utterances "
+                f"(~{target_seconds:.0f}s target, {snapped} silence-snapped cuts).")
+
+        weights = [s.duration for s in segs]
+        parts = chunking.partition_words_by_weights(words, weights)
+
+        for c_i, (seg, part_words) in enumerate(zip(segs, parts)):
+            seg_stem = f"{stem}_{c_i:03d}"
+            seg_wav = corpus_dir / f"{seg_stem}.wav"
+            segment_mod.cut_segment(ffmpeg, str(raw_wav), str(seg_wav), seg.start, seg.duration)
+            txt = corpus_dir / f"{seg_stem}.txt"
+            txt.write_text(words_to_text(part_words), encoding="utf-8")
+            jobs.append(CorpusJob(idx, c_i, str(seg_wav), str(txt), seg.duration))
         progress((idx + 1) / total, f"prepared {pair.audio.name}")
     return jobs
 
 
 def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
-                  dictionary: str, acoustic: str, log: LogFn) -> None:
+                  dictionary: str, acoustic: str, log: LogFn,
+                  num_jobs: int = 2) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     args = [
         "align",
@@ -165,7 +194,16 @@ def run_alignment(corpus_dir: Path, output_dir: Path, temp_dir: Path,
         "--clean",
         "--overwrite",
         "--temp_directory", str(temp_dir),
+        "--single_speaker",   # one narrator; also disables speaker adaptation
+        "--num_jobs", str(max(1, num_jobs)),
     ]
+    if model_present("g2p", dictionary):
+        # Cover words missing from the base dictionary (names, foreign
+        # phrases, ...) instead of leaving them unaligned. See ensure_models.
+        args += ["--g2p_model_path", dictionary]
+    else:
+        log("Note: no g2p model available for this dictionary; words "
+            "missing from it will not align.")
     invoke_mfa(args, log)
 
 
@@ -185,7 +223,7 @@ def _shift(tiers: Dict[str, List[Dict]], offset: float) -> Dict[str, List[Dict]]
 
 def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
                 log: LogFn) -> List[Dict]:
-    """Combine per-chunk TextGrids back into one JSON dict per audio pair."""
+    """Combine per-segment TextGrids back into one JSON dict per audio pair."""
     by_pair: Dict[int, List[CorpusJob]] = {}
     for job in jobs:
         by_pair.setdefault(job.pair_index, []).append(job)
@@ -205,16 +243,22 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
             if not tg_path.exists():
                 raise FileNotFoundError(f"Expected alignment output: {tg_path}")
             parsed = parse_textgrid(tg_path)
-            chunk_dur = 0.0
-            for name, intervals in parsed["tiers"].items():
-                for it in intervals:
-                    chunk_dur = max(chunk_dur, it["end"])
             shifted = _shift(parsed["tiers"], offset)
             for name, intervals in shifted.items():
                 tiers.setdefault(name, []).extend(intervals)
-            offset += chunk_dur
-            duration += chunk_dur
-            log(f"  Combined '{Path(job.wav).stem}' ({chunk_dur:.2f}s)")
+            # Use the PLANNED segment duration -- what we told ffmpeg to cut,
+            # known exactly -- as the offset increment for the next segment.
+            # Deliberately NOT inferred from MFA's own TextGrid (e.g. the last
+            # interval's end time): MFA regularly trims trailing silence off
+            # the end of its aligned output, which is shorter than the
+            # segment's true audio duration. Offsetting from that trimmed
+            # figure would make every later segment in the chapter start a
+            # little early, and with dozens of segments per chapter that
+            # drift compounds into audibly wrong highlighting well before the
+            # end of a long chapter.
+            offset += job.duration
+            duration += job.duration
+            log(f"  Combined '{Path(job.wav).stem}' ({job.duration:.2f}s)")
 
         words = [i for i in tiers.get("words", []) if i["text"]]
         phones = [i for i in tiers.get("phones", []) if i["text"]]
@@ -247,10 +291,13 @@ def write_zip(results: List[Dict], output_dir: Path, zip_path: Path,
 
 
 def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
-                 output_dir: Path, chunk_limit_bytes: int,
+                 output_dir: Path,
                  zip_name: Optional[str] = None,
                  auto_download: bool = True,
                  keep_temp: bool = False,
+                 num_jobs: int = 2,
+                 target_seconds: float = segment_mod.DEFAULT_TARGET,
+                 max_seconds: float = segment_mod.DEFAULT_MAX,
                  log: LogFn = _null_log,
                  progress: ProgressFn = _null_progress) -> Path:
     """Full pipeline; returns the produced zip path."""
@@ -259,7 +306,8 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
     try:
         ensure_models(acoustic, dictionary, auto_download, log)
         jobs = prepare_corpus(
-            pairs, work_dir, chunk_limit_bytes, log, progress, ffmpeg
+            pairs, work_dir, log, progress, ffmpeg,
+            target_seconds=target_seconds, max_seconds=max_seconds,
         )
         if not jobs:
             raise RuntimeError("No valid audio/text pairs to align.")
@@ -269,7 +317,8 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         alignment_dir = work_dir / "alignment"
         temp_dir = work_dir / "mfa_temp"
         progress(0.0, "aligning")
-        run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic, log)
+        run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
+                     log, num_jobs=num_jobs)
         progress(0.9, "building JSON")
         results = postprocess(alignment_dir, pairs, jobs, log)
         if not results:

@@ -8,17 +8,32 @@ resulting word/phone alignments as one JSON file per audio track inside a zip.
 
 1. You pick a folder containing a `.fb2` file and audio files (mp3, wav, ogg,
    m4a, flac, wma, aac, opus).
-2. The app lists the audio files and the FB2 chapters. You manually pair each
-   audio file with its chapter (`Pair ▶`).
+2. The app lists the audio files and the FB2 chapters. Pair each audio file
+   with its chapter one at a time (`Pair ▶`), or use **Auto-pair in order**
+   to positionally pair audio[i] with chapter[i] in one click — handy for a
+   book with hundreds of chapters that are already in the same order as the
+   audio files.
 3. Press **BEGIN**.
 4. The app:
    - converts each audio file to a 16 kHz mono WAV (via bundled `ffmpeg`),
-   - splits any audio whose WAV would exceed the **max chunk size**
-     (default 2 GB) into ≤ 2 GB chunks and splits the chapter text
-     proportionally, so MFA never has to swallow an oversized file and crash,
-   - runs `mfa align` (downloads the Russian `russian_mfa` acoustic model,
-     dictionary and g2p model automatically on first run — internet required),
-   - recombines chunk alignments (with correct time offsets),
+   - splits **every** chapter's audio into short (~30s, configurable)
+     utterances, snapped to detected silence so a cut never lands mid-word
+     (falls back to a hard time-based cut if a stretch has no pause), and
+     splits the chapter text proportionally across those utterances. This
+     always happens, regardless of file size: MFA's peak memory is driven by
+     the length of the *longest single utterance* it has to align, not by
+     how big the file is, and a ~15-minute chapter fed to MFA whole reliably
+     gets OOM-killed. See `app/segment.py` for the full rationale.
+   - runs `mfa align --single_speaker` (single-narrator audiobooks skip
+     unneeded speaker adaptation) with `--g2p_model_path` so words missing
+     from the base dictionary (character names, foreign phrases) still get a
+     generated pronunciation instead of silently failing to align (downloads
+     the Russian `russian_mfa` acoustic model, dictionary and g2p model
+     automatically on first run — internet required),
+   - recombines segment alignments using each segment's *planned* duration
+     (exactly what was cut from the audio) as the time offset — not MFA's own
+     aligned output, which can trim trailing silence and would otherwise
+     make every later segment in a chapter drift a little early,
    - writes `alignments_<folder>_<timestamp>.zip` with one `<track>.json` per
      audio file into the output folder.
 
@@ -95,9 +110,14 @@ uses the bundled `runtime` instead.)
 - **First run needs internet**: the acoustic model / dictionary / g2p model are
   downloaded once into `%USERPROFILE%\Documents\MFA`. Use the
   *Download models* button to fetch them ahead of time.
-- **Max chunk size**: audio is chunked into units no larger than this setting
-  (MB). The default 2048 MB matches the Windows 2 GB practical file limit for
-  the processing WAVs. Lower it if you still see memory pressure.
+- **Target utterance length (s)**: every chapter is split into utterances
+  around this long (default 30s), snapped to silence. The hard cap used if no
+  silence is found in time is 1.5× this value (45s at the default). Lower it
+  if you still see memory pressure; raise it (cautiously) if alignment seems
+  too fragmented on very clean, pause-heavy narration.
+- **Parallel jobs**: MFA workers to run concurrently (default 2). Raise it on
+  a machine with more CPU cores/RAM to speed up alignment; lower it to 1 if
+  you're still hitting memory pressure even with short utterances.
 - **Out-of-dictionary words**: MFA auto-uses the Russian g2p model to cover
   words missing from the dictionary. Numbers and punctuation are stripped from
   the transcript before alignment.
@@ -113,9 +133,12 @@ app/
   gui.py         Tkinter GUI: folder picker, pairing, options, live log
   worker.py      headless worker process (align / download-models)
   pipeline.py    corpus prep -> MFA -> TextGrid->JSON -> zip
-  fb2.py         FB2 parsing + transcript normalization
+  fb2.py         FB2 parsing (recurses nested Part/Chapter sections) +
+                 transcript normalization
+  segment.py     silence-aware utterance segmentation (the OOM fix)
   textgrid.py    Praat TextGrid parser
-  chunking.py    <= 2 GB chunk planning + transcript partitioning
+  chunking.py    transcript partitioning (even, and weighted by segment
+                 duration)
   audio.py       ffmpeg wrappers (convert, probe, split)
 tests/           unit + integration tests (integration needs ffmpeg)
 Auto-MFA.spec    PyInstaller spec (GUI shell only)

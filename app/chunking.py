@@ -73,3 +73,42 @@ def partition_words(words: List[str], num_chunks: int) -> List[List[str]]:
         parts.append(words[idx:idx + size])
         idx += size
     return parts
+
+
+def partition_words_by_weights(words: List[str], weights: List[float]) -> List[List[str]]:
+    """Split *words* across len(weights) parts, sized proportionally to *weights*.
+
+    Used to divide a chapter's transcript across silence-snapped audio
+    segments of unequal length (segment.plan_segments): a segment that is
+    twice as long as another gets roughly twice as many words. This is an
+    approximation -- it assumes a fairly steady narration pace -- but it only
+    has to get each *segment's own* transcript slice close enough for MFA to
+    align within that segment; a boundary that lands a word or two off just
+    means that word aligns at the very edge of its segment instead of the
+    next one, and the next real silence-snapped cut resets any drift.
+
+    Word boundaries are chosen via cumulative rounding (each boundary is
+    round(cumulative_weight_fraction * len(words))) so every word is used
+    exactly once and rounding error cannot accumulate into the last part.
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    if n == 1:
+        return [list(words)]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return partition_words(words, n)
+    total = len(words)
+    boundaries = [0]
+    cum = 0.0
+    for w in weights[:-1]:
+        cum += max(0.0, w)
+        boundaries.append(round(cum / total_weight * total))
+    boundaries.append(total)  # force exact end regardless of float rounding
+    # A weight of 0 (or heavy rounding) can produce a non-increasing boundary;
+    # clamp so no part gets a negative-length slice.
+    for i in range(1, len(boundaries)):
+        if boundaries[i] < boundaries[i - 1]:
+            boundaries[i] = boundaries[i - 1]
+    return [words[boundaries[i]:boundaries[i + 1]] for i in range(n)]

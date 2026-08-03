@@ -29,7 +29,8 @@ class AutoMfaApp(tk.Tk):
         self.output_folder = tk.StringVar()
         self.acoustic_model = tk.StringVar(value="russian_mfa")
         self.dictionary = tk.StringVar(value="russian_mfa")
-        self.chunk_mb = tk.StringVar(value="2048")
+        self.target_seconds = tk.StringVar(value="30")
+        self.num_jobs = tk.StringVar(value="2")
         self.auto_download = tk.BooleanVar(value=True)
         self.keep_temp = tk.BooleanVar(value=False)
 
@@ -74,6 +75,7 @@ class AutoMfaApp(tk.Tk):
         middle.grid(row=0, column=1, padx=6, pady=30)
         ttk.Button(middle, text="Pair ▶", command=self._pair_selected).pack(pady=4)
         ttk.Button(middle, text="◀ Unpair", command=self._remove_selected_pair).pack(pady=4)
+        ttk.Button(middle, text="Auto-pair\nin order", command=self._auto_pair).pack(pady=4)
         self.chapter_list = self._make_listbox(
             pairing, "FB2 chapters", 2)
 
@@ -100,9 +102,12 @@ class AutoMfaApp(tk.Tk):
         ttk.Label(opts, text="Dictionary:").grid(row=0, column=2, sticky="w")
         ttk.Entry(opts, textvariable=self.dictionary).grid(
             row=0, column=3, sticky="ew", padx=4)
-        ttk.Label(opts, text="Max chunk size (MB):").grid(row=1, column=0, sticky="w")
-        ttk.Entry(opts, textvariable=self.chunk_mb, width=10).grid(
+        ttk.Label(opts, text="Target utterance length (s):").grid(row=1, column=0, sticky="w")
+        ttk.Entry(opts, textvariable=self.target_seconds, width=10).grid(
             row=1, column=1, sticky="w", padx=4)
+        ttk.Label(opts, text="Parallel jobs:").grid(row=1, column=2, sticky="w")
+        ttk.Entry(opts, textvariable=self.num_jobs, width=10).grid(
+            row=1, column=3, sticky="w", padx=4)
         ttk.Label(opts, text="Output folder:").grid(row=2, column=0, sticky="w")
         ttk.Entry(opts, textvariable=self.output_folder).grid(
             row=2, column=1, columnspan=2, sticky="ew", padx=4)
@@ -210,6 +215,25 @@ class AutoMfaApp(tk.Tk):
             self.audio_list.selection_set(nxt)
             self.audio_list.see(nxt)
 
+    def _auto_pair(self) -> None:
+        """Pair audio[i] with chapter[i] positionally, for the common case of a
+        multi-chapter book whose audio files and FB2 chapters are already in
+        the same order -- avoids clicking Pair 300+ times for a long book."""
+        if not self.audio_files or not self.chapters:
+            messagebox.showinfo("Auto-pair", "Load a folder with audio and an FB2 first.")
+            return
+        n = min(len(self.audio_files), len(self.chapters))
+        if len(self.audio_files) != len(self.chapters):
+            if not messagebox.askyesno(
+                "Count mismatch",
+                f"{len(self.audio_files)} audio file(s) but {len(self.chapters)} chapter(s). "
+                f"Only the first {n} will be paired positionally (audio[i] ⇄ chapter[i]). "
+                "Continue?"):
+                return
+        self.pairs = [(i, i) for i in range(n)]
+        self._refresh_pairs()
+        self.log(f"Auto-paired {n} audio file(s) to chapter(s) in order.")
+
     def _remove_selected_pair(self) -> None:
         sel = self.pairs_list.curselection()
         if not sel:
@@ -228,12 +252,24 @@ class AutoMfaApp(tk.Tk):
     # --------------------------------------------------------- pipeline
     def _build_job(self) -> Path:
         try:
-            chunk_mb = int(self.chunk_mb.get())
-            if chunk_mb <= 0:
+            target_seconds = float(self.target_seconds.get())
+            if target_seconds <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Chunk size", "Max chunk size must be a positive integer (MB).")
+            messagebox.showerror(
+                "Target utterance length",
+                "Target utterance length must be a positive number of seconds.")
             raise
+        try:
+            num_jobs = int(self.num_jobs.get())
+            if num_jobs <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Parallel jobs", "Parallel jobs must be a positive integer.")
+            raise
+        # Mirrors the 30s/45s target/max ratio proven out on the govorim
+        # audiobook pipeline (see segment.py's module docstring).
+        max_seconds = target_seconds * 1.5
         job = {
             "pairs": [
                 {
@@ -246,7 +282,9 @@ class AutoMfaApp(tk.Tk):
             "acoustic_model": self.acoustic_model.get().strip() or "russian_mfa",
             "dictionary": self.dictionary.get().strip() or "russian_mfa",
             "output_dir": self.output_folder.get() or self.book_folder.get(),
-            "chunk_limit_bytes": chunk_mb * 1024 * 1024,
+            "target_seconds": target_seconds,
+            "max_seconds": max_seconds,
+            "num_jobs": num_jobs,
             "zip_name": default_zip_name(Path(self.output_folder.get() or ".")),
             "auto_download": self.auto_download.get(),
             "keep_temp": self.keep_temp.get(),
