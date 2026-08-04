@@ -9,6 +9,13 @@ from app.fb2 import (
     words_to_text,
 )
 
+def body(word, n=200):
+    """A chapter-sized paragraph. Splitting is only accepted when the
+    resulting pieces are chapter-sized (see _MIN_MEDIAN_CHAPTER_WORDS), so
+    fixtures have to be realistic or they exercise the reject path."""
+    return "<p>" + " ".join([word] * n) + ".</p>"
+
+
 FB2 = """<?xml version="1.0" encoding="utf-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
   <description><title-info><book-title>Test</book-title></title-info></description>
@@ -47,10 +54,12 @@ NESTED_FB2 = """<?xml version="1.0" encoding="utf-8"?>
       <section>
         <title><p>Chapter 1</p></title>
         <p>Chapter 1 Text of chapter one.</p>
+        BODY_ONE
       </section>
       <section>
         <title><p>Chapter 2</p></title>
         <p>Chapter 2 Text of chapter two.</p>
+        BODY_TWO
       </section>
     </section>
     <section>
@@ -58,11 +67,12 @@ NESTED_FB2 = """<?xml version="1.0" encoding="utf-8"?>
       <section>
         <title><p>Chapter 3</p></title>
         <p>Chapter 3 Text of chapter three.</p>
+        BODY_THREE
       </section>
     </section>
   </body>
 </FictionBook>
-"""
+""".replace("BODY_ONE", body("one")).replace("BODY_TWO", body("two")).replace("BODY_THREE", body("three"))
 
 
 class Fb2Test(unittest.TestCase):
@@ -129,13 +139,6 @@ FB2_HEAD = ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
             '<body>')
 FB2_TAIL = "</body></FictionBook>"
-
-
-def body(word, n=200):
-    """A chapter-sized paragraph. Splitting is only accepted when the
-    resulting pieces are chapter-sized (see _MIN_MEDIAN_CHAPTER_WORDS), so
-    fixtures have to be realistic or they exercise the reject path."""
-    return "<p>" + " ".join([word] * n) + ".</p>"
 
 
 def _fb2(sections):
@@ -265,3 +268,66 @@ class SubtitleChapterSplitTest(unittest.TestCase):
             "<subtitle>II</subtitle><poem>" + stanza + "</poem>"
             "<subtitle>III</subtitle><poem>" + stanza + "</poem></section>"))
         self.assertEqual(len(extract_chapters(p)), 1)
+
+
+class NestedSectionSizeGuardTest(unittest.TestCase):
+    """Nesting a <section> per unit is how one book marks its chapters and
+    how another marks something far smaller. Eugene Onegin wraps each of its
+    357 STANZAS in its own section inside eight "Глава" sections, so
+    recursing blindly to leaves turns an 8-chapter book into 357 fragments.
+    """
+
+    def _write(self, xml):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(xml, encoding="utf-8")
+        return p
+
+    def test_stanza_sized_subsections_keep_the_parent_whole(self):
+        stanza = ("<section><poem><stanza>"
+                  + "".join("<v>строка стиха здесь</v>" for _ in range(14))
+                  + "</stanza></poem></section>")
+        p = self._write(_fb2(
+            "<section><title><p>Глава первая</p></title>" + stanza * 40 + "</section>"
+            "<section><title><p>Глава вторая</p></title>" + stanza * 40 + "</section>"))
+        ch = extract_chapters(p)
+        self.assertEqual([c["title"] for c in ch], ["Глава первая", "Глава вторая"])
+
+    def test_chapter_sized_subsections_are_still_split(self):
+        p = self._write(_fb2(
+            "<section><title><p>ЧАСТЬ</p></title>"
+            "<section><title><p>I</p></title>" + body("раз") + "</section>"
+            "<section><title><p>II</p></title>" + body("два") + "</section>"
+            "</section>"))
+        self.assertEqual(len(extract_chapters(p)), 2)
+
+
+class TextIsCountedOnceTest(unittest.TestCase):
+    """<poem>/<stanza>/<v> and <title>/<p> nest text-bearing tags inside
+    text-bearing tags. Matching both levels made every verse line and every
+    heading appear twice in the transcript -- Горе от ума came out at double
+    its real length, which both misleads the aligner and inflates the word
+    counts the chapter-size guards depend on.
+    """
+
+    def _write(self, xml):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(xml, encoding="utf-8")
+        return p
+
+    def test_verse_lines_appear_once(self):
+        p = self._write(_fb2(
+            "<section><title><p>Стихи</p></title>"
+            "<poem><stanza><v>мороз</v><v>солнце</v></stanza></poem></section>"))
+        text = extract_chapters(p)[0]["text"]
+        self.assertEqual(text.split().count("мороз"), 1)
+        self.assertEqual(text.split().count("солнце"), 1)
+
+    def test_heading_text_appears_once(self):
+        p = self._write(_fb2(
+            "<section><title><p>Заглавие</p></title>" + body("слово") + "</section>"))
+        text = extract_chapters(p)[0]["text"]
+        self.assertEqual(text.split().count("Заглавие"), 1)

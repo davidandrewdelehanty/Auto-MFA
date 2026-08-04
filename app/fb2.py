@@ -16,6 +16,17 @@ _PUNCT_RE = re.compile(r"[^\w']+", flags=re.UNICODE)
 _MULTI_WS_RE = re.compile(r"\s+")
 
 
+# Tags that hold one readable passage and nothing further to descend into.
+_LEAF_TAGS = ("p", "v", "subtitle", "text-author", "th", "td")
+# Tags that normally WRAP the tags above (<title> holds <p>s, <stanza> holds
+# <v> lines, <cite> holds <p>s) but are sometimes written with bare text
+# instead. They are descended into first, and read directly only when that
+# turned up nothing -- reading both levels used to duplicate every verse line
+# and every heading, and reading only the wrapper ran the lines together
+# ("морозсолнце") because FB2 puts no whitespace between them.
+_TEXT_WRAPPERS = ("title", "stanza", "cite", "poem", "epigraph", "annotation")
+
+
 def _localname(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
@@ -37,15 +48,47 @@ def find_audio_files(folder: Path) -> List[Path]:
     return sorted(files, key=lambda p: p.name.lower())
 
 
-def _collect_text(elem: ET.Element) -> str:
+def _gather(elem: ET.Element, skip_sections: bool = False) -> str:
+    """Readable text under *elem*, each passage counted exactly once.
+
+    FB2 nests text-bearing tags inside text-bearing tags: a <poem> holds
+    <stanza> elements holding <v> lines, a <title> holds its own <p>.
+    Matching every level duplicated every verse line and every heading --
+    Горе от ума came out at twice its real length, which fed the aligner a
+    transcript saying everything twice and inflated the word counts the
+    chapter-size guards rely on.
+
+    With *skip_sections* the walk stops at nested <section> children, so a
+    part's own preamble (an epigraph before its first chapter) can be read
+    without also re-reading the chapters that follow it.
+    """
     parts: List[str] = []
-    for node in elem.iter():
+
+    def take(node: ET.Element) -> None:
         tag = _localname(node.tag)
-        if tag in ("p", "v", "subtitle", "stanza", "title", "cite", "text-author", "th", "td"):
+        if tag in _LEAF_TAGS:
             text = "".join(node.itertext()).strip()
             if text:
                 parts.append(text)
+            return
+        if skip_sections and tag == "section":
+            return
+        before = len(parts)
+        for child in node:
+            take(child)
+        if len(parts) == before and tag in _TEXT_WRAPPERS:
+            text = "".join(node.itertext()).strip()
+            if text:
+                parts.append(text)
+
+    for child in elem:
+        take(child)
     return " ".join(parts)
+
+
+def _collect_text(elem: ET.Element) -> str:
+    """All readable text under *elem*, including nested sections."""
+    return _gather(elem)
 
 
 def _section_title(section: ET.Element) -> str:
@@ -58,8 +101,7 @@ def _section_title(section: ET.Element) -> str:
 def _direct_text(section: ET.Element) -> str:
     """Text from *section*'s own content only -- NOT descending into nested
     <section> children (but still descending into wrapper elements like
-    <epigraph> or <poem> that hold their own <p>/<v> content, the same way
-    _collect_text does for a leaf section).
+    <epigraph> or <poem> that hold their own <p>/<v> content).
 
     Used for a section that contains both its own content and nested
     subsections (e.g. a "Part One" section with an epigraph before its first
@@ -67,24 +109,13 @@ def _direct_text(section: ET.Element) -> str:
     being silently dropped, without also re-collecting the nested
     subsections' text (they are walked separately, as their own chapters).
     """
-    parts: List[str] = []
-
-    def walk(elem: ET.Element) -> None:
-        for child in elem:
-            tag = _localname(child.tag)
-            if tag in ("section", "title"):
-                continue  # nested chapters, and the section's own title
-                          # (already captured separately by _section_title),
-                          # are excluded from the preamble text
-            if tag in ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td"):
-                text = "".join(child.itertext()).strip()
-                if text:
-                    parts.append(text)
-            else:
-                walk(child)  # descend into wrapper containers (epigraph, poem, ...)
-
-    walk(section)
-    return " ".join(parts)
+    holder = ET.Element("holder")
+    for child in section:
+        if _localname(child.tag) == "title":
+            continue    # already captured separately by _section_title
+        holder.append(child)   # ElementTree has no parent links, so this
+                               # borrows the child rather than moving it
+    return _gather(holder, skip_sections=True)
 
 
 # Cyrillic look-alikes for Latin roman-numeral letters. Russian FB2s mix them
@@ -240,11 +271,32 @@ def _walk_sections(section: ET.Element, chapters: List[Dict[str, str]]) -> None:
         if text:
             chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
         return
+
+    # Walk the subsections into a scratch list first, so their combined size
+    # can be sanity-checked before they are accepted as chapters.
+    sub: List[Dict[str, str]] = []
     preamble = _direct_text(section).strip()
     if preamble:
-        chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": preamble})
+        sub.append({"title": title or f"Chapter {len(chapters) + 1}", "text": preamble})
     for child in nested:
-        _walk_sections(child, chapters)
+        _walk_sections(child, sub)
+
+    # Same size guard as the subtitle split, for the same reason: nesting a
+    # <section> per unit is how one book marks its chapters and how another
+    # marks something much smaller. Eugene Onegin wraps each of its 357
+    # STANZAS in its own section inside the eight "Глава" sections, so
+    # recursing to leaves turns an 8-chapter book into 357 fragments with a
+    # median of 60 words. When the pieces come out that small the nesting was
+    # not chapter structure, so this section is kept whole instead.
+    if sub:
+        sizes = sorted(len(c["text"].split()) for c in sub)
+        if sizes[len(sizes) // 2] < _MIN_MEDIAN_CHAPTER_WORDS:
+            text = _collect_text(section).strip()
+            if text:
+                chapters.append({"title": title or f"Chapter {len(chapters) + 1}",
+                                 "text": text})
+            return
+    chapters.extend(sub)
 
 
 def extract_chapters(path: Path) -> List[Dict[str, str]]:
