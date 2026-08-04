@@ -189,6 +189,11 @@ also used for things that are not chapters:
 - **The numeral is not left in the chapter text.** It names the chapter; the
   narrator doesn't read it aloud, and leaving it in feeds the aligner a
   stray `i` that isn't spoken.
+- **The pieces must be chapter-sized.** Verse numbers its *stanzas* with
+  roman numerals exactly as prose numbers its chapters — Eugene Onegin has
+  391 such subtitles, and splitting on them gives 380 pieces averaging 60
+  words. A median under 150 words means the markers were counting something
+  other than chapters, so the split is abandoned.
 
 A numeral may carry a name — Anna Karenina has both `XX` and `XX СМЕРТЬ`.
 

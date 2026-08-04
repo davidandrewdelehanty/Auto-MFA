@@ -101,6 +101,15 @@ _CHAPTER_MARK_RE = re.compile(r"^(?:глава\s+)?([ivxlcdm]+)\.?(?:\s+\S.*)?$"
 # Tags that carry readable text inside a section.
 _TEXT_TAGS = ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td")
 
+# A split is only believable if the pieces are chapter-sized. Verse works
+# number their STANZAS with roman numerals in exactly the same way prose
+# works number their chapters: Eugene Onegin has 391 such subtitles, and
+# splitting on them yields 380 pieces with a median of 60 words -- stanzas,
+# not chapters. Real chapters are far bigger (median 1149 words in Anna
+# Karenina, 4172 in Crime and Punishment, minimum 212), so a median below
+# this means the markers were numbering something else.
+_MIN_MEDIAN_CHAPTER_WORDS = 150
+
 
 def _chapter_marker(text: str) -> str:
     """Return the roman numeral if *text* opens like a chapter heading.
@@ -179,6 +188,7 @@ def _split_leaf_on_subtitles(section: ET.Element, title: str,
         current[1].append(child)
     groups.append(current)
 
+    candidates: List[Dict[str, str]] = []
     for marker, elems in groups:
         text = _text_from(elems).strip()
         if not text:
@@ -190,8 +200,17 @@ def _split_leaf_on_subtitles(section: ET.Element, title: str,
         if marker and title:
             name = f"{title} — {marker}"
         else:
-            name = marker or title or f"Chapter {len(chapters) + 1}"
-        chapters.append({"title": name, "text": text})
+            name = marker or title or f"Chapter {len(chapters) + len(candidates) + 1}"
+        candidates.append({"title": name, "text": text})
+
+    if len(candidates) < 2:
+        return False
+    sizes = sorted(len(c["text"].split()) for c in candidates)
+    median = sizes[len(sizes) // 2]
+    if median < _MIN_MEDIAN_CHAPTER_WORDS:
+        return False                  # stanzas or similar -- see the constant
+
+    chapters.extend(candidates)
     return True
 
 
