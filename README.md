@@ -162,6 +162,36 @@ to report. WhisperX did emit dash tokens. If Govorim's highlighting matches
 `word_timings` to rendered spans strictly by index, verify that against a
 chapter containing dashes before bulk-processing a library.
 
+## How chapters are found in an FB2
+
+Two layouts occur in practice and both are handled:
+
+1. **One `<section>` per chapter**, usually nested inside a Part section.
+   War and Peace does this — 361 leaf sections, one per chapter.
+2. **One section per PART**, with each chapter marked by a `<subtitle>`
+   holding a roman numeral. Anna Karenina and Crime and Punishment do this.
+   Read as layout 1, Anna Karenina extracts as *8* enormous chapters
+   instead of 239, and can't be paired against one audio file per chapter.
+
+Splitting on `<subtitle>` is deliberately conservative, because the tag is
+also used for things that are not chapters:
+
+- **Roman numerals only.** Crime and Punishment's `ПРИМЕЧАНИЯ` section holds
+  273 subtitles numbered `1, 2, 3…`; treating arabic numbers as chapters
+  would bury the novel's 41 real ones.
+- **At least two, and distinct.** One `Занавес` at the end of an act, or the
+  single `Конец.` in War and Peace, must never fragment a section that was
+  already right. Requiring distinct numerals also stops a run of lines
+  opening with the Russian preposition `С ` — which transliterates to a
+  valid roman `C` — from looking like a numbered sequence.
+- **Cyrillic homoglyphs are normalised.** `ХІV` is often Cyrillic Х plus
+  Ukrainian І plus Latin V.
+- **The numeral is not left in the chapter text.** It names the chapter; the
+  narrator doesn't read it aloud, and leaving it in feeds the aligner a
+  stray `i` that isn't spoken.
+
+A numeral may carry a name — Anna Karenina has both `XX` and `XX СМЕРТЬ`.
+
 ## Multiple languages (French/German/English passages)
 
 Russian classics (War and Peace especially) often have paragraphs or whole
@@ -300,8 +330,8 @@ app/
                  fragments, word_timings
   worker.py      headless worker process (align / download-models)
   pipeline.py    corpus prep -> MFA -> TextGrid -> JSON
-  fb2.py         FB2 parsing (recurses nested Part/Chapter sections) +
-                 transcript normalization
+  fb2.py         FB2 parsing (nested Part/Chapter sections AND parts that
+                 mark chapters with <subtitle>) + transcript normalization
   segment.py     silence-aware utterance segmentation (the OOM fix)
   textgrid.py    Praat TextGrid parser
   chunking.py    transcript partitioning (even, and weighted by segment

@@ -87,6 +87,114 @@ def _direct_text(section: ET.Element) -> str:
     return " ".join(parts)
 
 
+# Cyrillic look-alikes for Latin roman-numeral letters. Russian FB2s mix them
+# freely -- "ХІV" can be Cyrillic Х + Ukrainian І + Latin V -- and a numeral
+# read literally would not match anything.
+_ROMAN_HOMOGLYPHS = str.maketrans({
+    "Х": "X", "І": "I", "Ѵ": "V", "С": "C", "М": "M", "Д": "D",
+})
+# A chapter marker is a roman numeral, optionally followed by that chapter's
+# own name -- Anna Karenina has both bare "XX" and "XX СМЕРТЬ".
+_CHAPTER_MARK_RE = re.compile(r"^(?:глава\s+)?([ivxlcdm]+)\.?(?:\s+\S.*)?$",
+                              re.IGNORECASE | re.DOTALL)
+
+# Tags that carry readable text inside a section.
+_TEXT_TAGS = ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td")
+
+
+def _chapter_marker(text: str) -> str:
+    """Return the roman numeral if *text* opens like a chapter heading.
+
+    Deliberately accepts ROMAN numerals only. Many Russian FB2s mark real
+    chapters this way inside a part-level section, but they also use
+    `<subtitle>` for things that are NOT chapters: scene breaks ("* * *"),
+    stage directions ("Занавес"), an end marker ("Конец."), and -- the case
+    that makes arabic numbers unsafe -- numbered endnotes. Crime and
+    Punishment's ПРИМЕЧАНИЯ section carries 273 subtitles numbered 1, 2,
+    3...; treating those as chapters would bury the novel's 41 real ones.
+    """
+    s = (text or "").strip().translate(_ROMAN_HOMOGLYPHS)
+    match = _CHAPTER_MARK_RE.match(s) if s else None
+    return match.group(1).upper() if match else ""
+
+
+def _text_from(elements) -> str:
+    """Readable text of *elements*, not descending into nested sections."""
+    parts: List[str] = []
+
+    def take(elem: ET.Element) -> None:
+        tag = _localname(elem.tag)
+        if tag == "section":
+            return
+        if tag in _TEXT_TAGS:
+            text = "".join(elem.itertext()).strip()
+            if text:
+                parts.append(text)
+            return
+        for child in elem:
+            take(child)
+
+    for elem in elements:
+        take(elem)
+    return " ".join(parts)
+
+
+def _split_leaf_on_subtitles(section: ET.Element, title: str,
+                             chapters: List[Dict[str, str]]) -> bool:
+    """Split one leaf section into a chapter per roman-numeral `<subtitle>`.
+
+    Some books nest a `<section>` per chapter (War and Peace); others put a
+    whole part in one section and mark each chapter with a `<subtitle>`
+    (Anna Karenina, Crime and Punishment). Without this, the latter come out
+    as a handful of enormous "chapters" -- Anna Karenina as 8 instead of
+    239 -- which cannot be paired against one audio file per chapter.
+
+    Returns False (splitting nothing) unless the section holds at least two
+    chapter markers, so a lone "Занавес" or "Конец." can't fragment a
+    section that was already correct.
+    """
+    marks = [c for c in section
+             if _localname(c.tag) == "subtitle"
+             and _chapter_marker("".join(c.itertext()))]
+    # Two or more, and genuinely different numerals. Requiring distinct
+    # values is what stops a run of subtitles that merely *start* with a
+    # roman-numeral letter -- a Russian line opening with the preposition
+    # "С ", which transliterates to a valid "C" -- from being mistaken for
+    # a numbered chapter sequence.
+    if len({_chapter_marker("".join(c.itertext())) for c in marks}) < 2:
+        return False
+
+    mark_ids = {id(m) for m in marks}
+    groups: List = []                 # [(heading or None, [elements])]
+    current = (None, [])
+    for child in section:
+        if _localname(child.tag) == "title":
+            continue                  # captured separately as the part name
+        if id(child) in mark_ids:
+            groups.append(current)
+            # Keep the subtitle's full text as the heading: Anna Karenina's
+            # "XX СМЕРТЬ" names the chapter as well as numbering it.
+            current = ("".join(child.itertext()).strip(), [])
+            continue
+        current[1].append(child)
+    groups.append(current)
+
+    for marker, elems in groups:
+        text = _text_from(elems).strip()
+        if not text:
+            continue                  # e.g. nothing between the part title
+                                      # and its first chapter marker
+        # The marker itself is the chapter's name, not part of what is read
+        # aloud -- keeping it out of the text avoids feeding the aligner a
+        # stray "i"/"ii" that the narrator never says.
+        if marker and title:
+            name = f"{title} — {marker}"
+        else:
+            name = marker or title or f"Chapter {len(chapters) + 1}"
+        chapters.append({"title": name, "text": text})
+    return True
+
+
 def _walk_sections(section: ET.Element, chapters: List[Dict[str, str]]) -> None:
     """Depth-first: append one chapter per LEAF <section> (no nested
     <section> children), in document order.
@@ -105,6 +213,10 @@ def _walk_sections(section: ET.Element, chapters: List[Dict[str, str]]) -> None:
     nested = [c for c in section if _localname(c.tag) == "section"]
     title = _section_title(section)
     if not nested:
+        # A part-in-one-section book marks its chapters with <subtitle>;
+        # split on those when present (see _split_leaf_on_subtitles).
+        if _split_leaf_on_subtitles(section, title, chapters):
+            return
         text = _collect_text(section).strip()
         if text:
             chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
