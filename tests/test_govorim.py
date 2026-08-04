@@ -404,6 +404,37 @@ class UploadScriptTest(unittest.TestCase):
         script = self._script()
         self.assertIn("AUTO_MFA_R2_REMOTE", script)
 
+    def test_disables_every_s3_feature_r2_lacks(self):
+        """R2 returns 501 NotImplemented for S3 features it doesn't have,
+        and which ones get sent depends on the saved remote config -- so
+        force them off per-run instead of trusting the config."""
+        script = self._script()
+        for flag in ("--s3-provider Cloudflare", "--s3-acl", "--s3-no-check-bucket",
+                     "--s3-disable-checksum"):
+            self.assertIn(flag, script)
+
+    def test_avoids_the_multipart_api_entirely(self):
+        # Multipart is a common source of R2 501s and buys nothing for
+        # audio files; a cutoff above any single file keeps every upload
+        # a plain PutObject.
+        script = self._script()
+        self.assertIn("--s3-upload-cutoff 200M", script)
+        self.assertIn("--s3-chunk-size 200M", script)
+
+    def test_verifies_against_the_bucket_not_the_exit_status(self):
+        """Older rclone reports 501 for uploads to R2 that actually
+        succeeded, so 'did it work' has to be answered by listing the
+        bucket, not by whether rclone returned non-zero."""
+        script = self._script()
+        self.assertIn("present_count", script)
+        self.assertIn("rclone lsf", script)
+        self.assertIn("set +e", script)          # a failing pass must not abort
+        self.assertIn("for pass in", script)     # ...and must be retried
+
+    def test_retry_loop_cannot_spin_forever(self):
+        script = self._script()
+        self.assertIn("No progress this pass", script)
+
 
 FB2_WITH_META = """<?xml version="1.0" encoding="utf-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">

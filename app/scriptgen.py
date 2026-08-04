@@ -338,8 +338,9 @@ def build_upload_script(r2_folder: str, source_dir_wsl: str,
 #     {bucket}/{r2_folder}/
 # which is what the generated JSONs' audio_url fields point at.
 #
-# Re-running is safe: rclone copy skips files already present with the
-# same size and modification time.
+# Re-running is safe: files already on R2 are skipped, and the script
+# re-checks the bucket after each pass rather than trusting rclone's exit
+# status (see the R2 notes further down).
 
 set -euo pipefail
 
@@ -375,14 +376,77 @@ if [ ! -f "$LIST" ]; then
     exit 1
 fi
 
-echo "Uploading $(wc -l < "$LIST") file(s) to $REMOTE:$BUCKET/$FOLDER/ ..."
-rclone copy "$SRC" "$REMOTE:$BUCKET/$FOLDER/" \\
-    --files-from "$LIST" \\
-    --progress \\
-    --transfers 8
+# ---- R2 compatibility ---------------------------------------------------
+# R2 answers "NotImplemented (501)" for S3 features it doesn't have, so every
+# one of them is disabled explicitly here rather than trusting whatever the
+# saved remote config happens to say:
+#   --s3-provider Cloudflare  speak R2's dialect, not AWS's
+#   --s3-acl ""               R2 has no ACLs; don't send x-amz-acl
+#   --s3-no-check-bucket      required for object-scoped API tokens
+#   --s3-disable-checksum     skip MD5-in-metadata on upload
+#   --s3-upload-cutoff/chunk  200M is above any single audio file, so every
+#                             object is one PutObject and the multipart API
+#                             is never touched
+#   --size-only               compare on size; no extra checksum calls
+R2FLAGS=(
+    --s3-provider Cloudflare
+    --s3-acl ""
+    --s3-no-check-bucket
+    --s3-disable-checksum
+    --s3-upload-cutoff 200M
+    --s3-chunk-size 200M
+    --size-only
+)
 
+WANT=$(grep -c . "$LIST")
+
+# How many of the wanted files are actually on R2 right now. This -- not
+# rclone's exit status -- decides whether the upload is done: older
+# rclone builds (seen on v1.60) report 501 for uploads to R2 that in fact
+# SUCCEEDED, and counting the bucket is the only honest check.
+present_count () {{
+    rclone lsf "$REMOTE:$BUCKET/$FOLDER/" "${{R2FLAGS[@]}}" 2>/dev/null \\
+        | sort > /tmp/_r2_have.$$ || true
+    sort "$LIST" > /tmp/_r2_want.$$
+    comm -12 /tmp/_r2_have.$$ /tmp/_r2_want.$$ | grep -c . || true
+    rm -f /tmp/_r2_have.$$ /tmp/_r2_want.$$
+}}
+
+echo "Uploading $WANT file(s) to $REMOTE:$BUCKET/$FOLDER/ ..."
+rclone version | head -1
+
+for pass in 1 2 3 4 5; do
+    have=$(present_count)
+    echo
+    echo "===== pass $pass -- R2 holds $have / $WANT of this book's files ====="
+    if [ "$have" -ge "$WANT" ]; then echo "All present."; break; fi
+    set +e
+    rclone copy "$SRC" "$REMOTE:$BUCKET/$FOLDER/" \\
+        --files-from "$LIST" \\
+        "${{R2FLAGS[@]}}" \\
+        --transfers 4 \\
+        --retries 5 --low-level-retries 10 \\
+        --progress
+    set -e
+    after=$(present_count)
+    echo "pass $pass: $have -> $after"
+    if [ "$after" -le "$have" ] && [ "$pass" -gt 1 ]; then
+        echo "No progress this pass -- stopping rather than spinning." >&2
+        break
+    fi
+done
+
+final=$(present_count)
 echo
-echo "Done. Now in $BUCKET/$FOLDER/:"
-rclone lsf "$REMOTE:$BUCKET/$FOLDER/"
+echo "=================================================="
+echo "$BUCKET/$FOLDER/ holds $final / $WANT of this book's files"
+if [ "$final" -ge "$WANT" ]; then
+    echo "Upload complete. Any 501 errors above were mis-reported -- the"
+    echo "objects are on R2, which is what the count above verifies."
+else
+    echo "Still short. Re-run this script; each pass makes progress."
+    echo "If it never converges, update rclone -- 501s on R2 are a known"
+    echo "problem with older builds:  curl https://rclone.org/install.sh | sudo bash"
+fi
 """
 

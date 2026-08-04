@@ -198,6 +198,17 @@ endnotes section, a different edition).
 Run the `rclone config create` command in *Uploading the audio to R2* above.
 The script prints it too, with your endpoint already filled in.
 
+**Upload prints `NotImplemented (501)` errors**
+Usually harmless — older rclone builds report 501 for uploads to R2 that
+actually succeeded. The script re-checks the bucket after each pass and
+prints `holds N / M` at the end; if that reaches M, everything is up no
+matter how many errors scrolled by. If it never converges, update rclone:
+
+```bash
+# WSL
+curl https://rclone.org/install.sh | sudo bash
+```
+
 **Book installed but doesn't appear in the picker**
 Check `public/books/index.json` has an entry whose `filename` matches the FB2
 you installed. The install script writes one; if you moved or renamed the FB2

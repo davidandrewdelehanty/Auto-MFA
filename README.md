@@ -357,3 +357,22 @@ folder that gets copied around, so a leaked key there would be a real
 problem. It expects an rclone remote (default name `r2`, overridable via
 `AUTO_MFA_R2_REMOTE`) configured once on the machine, and prints the exact
 `rclone config create` command, endpoint included, if it's missing.
+
+### R2 quirks the script works around
+
+R2 answers `501 NotImplemented` for S3 features it doesn't implement, and
+which of those rclone sends depends on the saved remote config — so the
+script forces them off per-run rather than trusting it: `--s3-provider
+Cloudflare`, `--s3-acl ""` (R2 has no ACLs), `--s3-no-check-bucket` (needed
+for object-scoped tokens), `--s3-disable-checksum`, and an upload cutoff
+above any single audio file so the multipart API is never touched.
+
+More awkward: **older rclone reports 501 for uploads that actually
+succeeded.** Observed on v1.60 — the object lands, a subsequent `HEAD`
+returns it with the right size, and rclone still counts the transfer as
+failed. So the script never trusts rclone's exit status. It lists the
+bucket, counts how many of *this book's* files are present, uploads, counts
+again, and repeats until the count is complete or a pass makes no progress.
+The closing `holds N / M` line is the real answer. Updating rclone
+(`curl https://rclone.org/install.sh | sudo bash`) fixes the mis-reporting
+at source.
