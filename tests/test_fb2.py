@@ -217,9 +217,11 @@ class SubtitleChapterSplitTest(unittest.TestCase):
 
     def test_arabic_numbers_do_not_split(self):
         """Crime and Punishment's ПРИМЕЧАНИЯ has 273 subtitles numbered
-        1, 2, 3... Treating those as chapters would bury the 41 real ones."""
+        1, 2, 3... Treating those as chapters would bury the 41 real ones.
+        (Titled here as an ordinary part, so this exercises the numbering
+        rule rather than the notes-section rule tested separately below.)"""
         p = self._write(_fb2(
-            "<section><title><p>ПРИМЕЧАНИЯ</p></title>"
+            "<section><title><p>ЧАСТЬ ПЕРВАЯ</p></title>"
             "<subtitle>1</subtitle>" + body("прим1") + ""
             "<subtitle>2</subtitle>" + body("прим2") + ""
             "<subtitle>3</subtitle>" + body("прим3") + "</section>"))
@@ -331,3 +333,101 @@ class TextIsCountedOnceTest(unittest.TestCase):
             "<section><title><p>Заглавие</p></title>" + body("слово") + "</section>"))
         text = extract_chapters(p)[0]["text"]
         self.assertEqual(text.split().count("Заглавие"), 1)
+
+
+class MainBodyNotesTest(unittest.TestCase):
+    """FB2 normally puts endnotes in <body name="notes">, which is skipped
+    outright, but plenty of files leave them as an ordinary section of the
+    main body. They are never recorded, so counting one as a chapter shifts
+    every later chapter's pairing against the audio by one.
+    """
+
+    def _write(self, xml):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(xml, encoding="utf-8")
+        return p
+
+    def test_notes_section_is_not_a_chapter(self):
+        for heading in ("ПРИМЕЧАНИЯ", "Сноски", "Комментарии", "Notes"):
+            with self.subTest(heading=heading):
+                p = self._write(_fb2(
+                    "<section><title><p>Глава</p></title>" + body("слово") + "</section>"
+                    "<section><title><p>" + heading + "</p></title>"
+                    + body("сноска") + "</section>"))
+                self.assertEqual([c["title"] for c in extract_chapters(p)], ["Глава"])
+
+    def test_a_chapter_merely_mentioning_notes_is_kept(self):
+        p = self._write(_fb2(
+            "<section><title><p>Примечания издателя к первому тому</p></title>"
+            + body("слово") + "</section>"))
+        self.assertEqual(len(extract_chapters(p)), 1)
+
+
+class FrontMatterTest(unittest.TestCase):
+    """A dedication or colophon sits in the main body as an untitled scrap.
+    It is not recorded, and counting it as chapter 1 shifts every chapter's
+    audio by one -- "Моя любимая страна" opens with exactly that.
+    """
+
+    def _write(self, xml):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(xml, encoding="utf-8")
+        return p
+
+    def test_short_untitled_opening_is_dropped(self):
+        p = self._write(_fb2(
+            "<section><epigraph><p>Памяти друга.</p></epigraph></section>"
+            "<section><title><p>Глава</p></title>" + body("слово") + "</section>"))
+        self.assertEqual([c["title"] for c in extract_chapters(p)], ["Глава"])
+
+    def test_untitled_but_chapter_sized_is_kept(self):
+        p = self._write(_fb2(
+            "<section>" + body("слово") + "</section>"
+            "<section><title><p>Глава</p></title>" + body("другое") + "</section>"))
+        self.assertEqual(len(extract_chapters(p)), 2)
+
+
+class UntitledSubsectionsTest(unittest.TestCase):
+    """Nesting counts as chapter structure only when the subsections are
+    chapters in their own right. "Моя любимая страна" builds each of its 14
+    essays from an untitled opening plus the titled piece it introduces.
+    """
+
+    def _write(self, xml):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(xml, encoding="utf-8")
+        return p
+
+    def test_untitled_half_keeps_the_essay_whole(self):
+        p = self._write(_fb2(
+            "<section><title><p>Эссе</p></title>"
+            "<section>" + body("вступление") + "</section>"
+            "<section><title><p>Репортаж</p></title>" + body("репортаж") + "</section>"
+            "</section>"))
+        self.assertEqual([c["title"] for c in extract_chapters(p)], ["Эссе"])
+
+    def test_one_untitled_among_many_still_splits(self):
+        inner = "".join(
+            "<section><title><p>%d</p></title>%s</section>" % (i, body("глава"))
+            for i in range(9))
+        p = self._write(_fb2(
+            "<section><title><p>ЧАСТЬ</p></title>"
+            + inner + "<section>" + body("безымянная") + "</section></section>"))
+        self.assertEqual(len(extract_chapters(p)), 10)
+
+    def test_structural_subsections_are_judged_by_their_own_children(self):
+        """Тихий Дон's "КНИГА ТРЕТЬЯ" wraps two UNTITLED parts that hold 63
+        chapters between them; judging the book by its own children's titles
+        would swallow all 63."""
+        part = ("<section>" + "".join(
+            "<section><title><p>%d</p></title>%s</section>" % (i, body("глава"))
+            for i in range(5)) + "</section>")
+        p = self._write(_fb2(
+            "<section><title><p>КНИГА</p></title>" + part + part + "</section>"))
+        self.assertEqual(len(extract_chapters(p)), 10)

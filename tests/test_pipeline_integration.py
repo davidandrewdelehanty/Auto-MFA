@@ -477,7 +477,7 @@ class UnalignedSegmentsTest(unittest.TestCase):
         txt.write_text(" ".join(f"w{i}_{k}" for k in range(n_words)), encoding="utf-8")
         return CorpusJob(0, i, str(wav), str(txt), duration=1.0)
 
-    def _run(self, writer, n_jobs=10, num_jobs=2, **kw):
+    def _run(self, writer, n_jobs=10, num_jobs=2, log_to=None, **kw):
         """Run the pipeline with run_alignment replaced by *writer*.
 
         Returns (result, calls) where calls records each alignment attempt's
@@ -510,7 +510,8 @@ class UnalignedSegmentsTest(unittest.TestCase):
             result = run_pipeline(
                 pairs=[Pair(work_dir / "audio.mp3", "Chapter 1", "text")],
                 acoustic="russian_mfa", dictionary="russian_mfa",
-                output_dir=out_dir, num_jobs=num_jobs, log=lambda m: None,
+                output_dir=out_dir, num_jobs=num_jobs,
+                log=(log_to.append if log_to is not None else (lambda m: None)),
                 **kw,
             )
         return result, calls
@@ -545,7 +546,20 @@ class UnalignedSegmentsTest(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("2/29", msg)
         # The message should point at the real cause rather than blaming MFA.
-        self.assertIn("transcript", msg.lower())
+        self.assertIn("paired", msg.lower())
+
+    def test_a_partial_alignment_still_produces_output(self):
+        """Audio and book disagree constantly -- a spoken title card, a
+        footnote read aloud, an abridged passage. Whatever did align is
+        worth having, so a shortfall warns instead of failing."""
+        result, _ = self._run(lambda jobs, beam: jobs[:15], n_jobs=29)
+        self.assertTrue(result.exists())
+
+    def test_warns_rather_than_silently_shipping_a_partial_run(self):
+        logged = []
+        self._run(lambda jobs, beam: jobs[:15], n_jobs=29, log_to=logged)
+        self.assertTrue(any("Warning" in m and "14/29" in m for m in logged),
+                        f"no shortfall warning in: {logged}")
 
     def test_missing_segment_does_not_shift_later_timings(self):
         """The gap must not drift the rest of the chapter.

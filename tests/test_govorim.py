@@ -22,6 +22,7 @@ import shutil
 import subprocess
 
 from app import govorim
+from app.govorim import attach_timings, build_chapter
 from app.fb2 import extract_metadata
 from app.pipeline import CorpusJob, Pair, run_pipeline, write_govorim
 from app.scriptgen import (build_install_script, build_script,
@@ -612,3 +613,83 @@ class InstallScriptTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _aligned(words, step=1.0, offset=0.0):
+    """Fake MFA output: one word per `step` seconds."""
+    return [{"text": w, "start": offset + i * step, "end": offset + i * step + 0.5}
+            for i, w in enumerate(words)]
+
+
+class PartialMatchTest(unittest.TestCase):
+    """Audio and book disagree in every direction, and the mapping has to
+    survive all of them: match what it can, leave the rest untimed, and
+    never hand a token another token's timing.
+    """
+
+    def test_spoken_preamble_not_in_the_text_is_ignored(self):
+        """Narrators announce the book and chapter before reading it. Those
+        words reach the aligner from the audio side only."""
+        text = "Мороз и солнце день чудесный"
+        aligned = _aligned(["елена", "костюченко", "глава", "первая"]
+                           + text.lower().split())
+        words = attach_timings(text, aligned)
+        self.assertEqual([w["word"] for w in words], text.split())
+        # First real word takes the timing of the 5th aligned entry, not the 1st.
+        self.assertEqual(words[0]["begin"], 4.0)
+
+    def test_text_the_narrator_skipped_gets_no_timing(self):
+        """A footnote, an editor's preface, a passage the recording cuts:
+        present in the FB2, absent from the audio."""
+        text = "Первое слово пропущенная вставка совсем лишняя второе слово"
+        aligned = _aligned(["первое", "слово", "второе", "слово"])
+        words = attach_timings(text, aligned)
+        self.assertEqual([w["word"] for w in words],
+                         ["Первое", "слово", "второе", "слово"])
+
+    def test_a_long_hole_does_not_shift_later_words(self):
+        """The failure this replaces: past a gap, a lockstep walk re-synced
+        on the first coincidentally equal short word and skewed the rest of
+        the chapter onto the wrong timings."""
+        head = ["альфа", "бета", "гамма"]
+        hole = ["и"] * 40
+        tail = ["дельта", "эпсилон"]
+        text = " ".join(head + hole + tail)
+        # MFA aligned the head and the tail; the middle utterance produced
+        # nothing at all.
+        aligned = _aligned(head, offset=0.0) + _aligned(tail, offset=100.0)
+        words = attach_timings(text, aligned)
+        by_word = {w["word"]: w["begin"] for w in words}
+        self.assertEqual(by_word["дельта"], 100.0)
+        self.assertEqual(by_word["эпсилон"], 101.0)
+
+    def test_timings_never_go_backwards(self):
+        text = "один два три четыре пять шесть семь восемь"
+        aligned = _aligned(["один", "два", "лишнее", "четыре", "пять",
+                            "шесть", "восемь"])
+        words = attach_timings(text, aligned)
+        begins = [w["begin"] for w in words]
+        self.assertEqual(begins, sorted(begins))
+
+    def test_fragments_stay_on_their_own_sentence(self):
+        """A token with no timing must not shift later sentences onto
+        earlier words -- the reason fragments index tokens by position."""
+        text = "Первое предложение здесь. Второе предложение тут."
+        aligned = _aligned(["первое", "здесь", "второе", "предложение", "тут"])
+        doc = build_chapter(text, aligned, "https://example/x.mp3")
+        self.assertEqual([f["text"] for f in doc["fragments"]],
+                         ["Первое предложение здесь.", "Второе предложение тут."])
+        self.assertEqual([w["word"] for w in doc["fragments"][1]["words"]],
+                         ["Второе", "предложение", "тут."])
+
+    def test_nothing_aligned_yields_no_fragments_rather_than_wrong_ones(self):
+        doc = build_chapter("Совершенно другой текст", _aligned(["ничего"]),
+                            "https://example/x.mp3")
+        self.assertEqual(doc["fragments"], [])
+        self.assertEqual(doc["word_timings"], [])
+
+    def test_low_coverage_is_reported(self):
+        logged = []
+        text = " ".join(["слово%d" % i for i in range(20)])
+        attach_timings(text, _aligned(["слово0", "слово1"]), log=logged.append)
+        self.assertTrue(any("only" in m.lower() for m in logged), logged)

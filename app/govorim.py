@@ -31,8 +31,9 @@ are the whole reason this module exists:
 There are no ``phones`` in Govorim's schema; that tier is dropped here.
 """
 
+import difflib
 import re
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .fb2 import transcript_words
@@ -51,11 +52,11 @@ DEFAULT_NARRATOR = "audiobook"
 # ellipsis, closing guillemet, en/em dash.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…»–—])\s+")
 
-# How far ahead to look for a re-sync when an aligned word doesn't match the
-# token it was expected to. MFA can occasionally drop a word it failed to
-# align at all; without a resync every later word in the chapter would be
-# shifted onto the wrong token, silently corrupting the whole file.
-_RESYNC_WINDOW = 8
+# Below this share of the text carrying timings, the mapping is reported as
+# suspect. It is not an error: a chapter where the narrator reads a preface
+# that isn't in the book, or skips a footnote that is, legitimately yields
+# partial timings, and partial highlighting beats none.
+_LOW_COVERAGE = 0.60
 
 
 def split_sentences(text: str) -> List[str]:
@@ -84,75 +85,112 @@ def _expected_norm(token: str) -> List[str]:
     return transcript_words(token)
 
 
-def attach_timings(text: str, aligned: Sequence[Dict],
-                   log: Optional[callable] = None) -> List[Dict]:
+def _normalized_index(text: str) -> Tuple[List[str], List[int], List[str]]:
+    """Break *text* into the normalized word stream MFA would have seen.
+
+    Returns ``(norm_words, owner, tokens)``: the normalized stream, the
+    index of the surface token each normalized word came from, and the
+    surface tokens themselves. A hyphenated token ("какого-то") contributes
+    two normalized words that both point back at the one displayed token;
+    punctuation-only tokens contribute none.
+    """
+    tokens = surface_tokens(text)
+    norm: List[str] = []
+    owner: List[int] = []
+    for ti, token in enumerate(tokens):
+        for word in _expected_norm(token):
+            norm.append(word)
+            owner.append(ti)
+    return norm, owner, tokens
+
+
+def _attach_indexed(text: str, aligned: Sequence[Dict],
+                    log: Optional[callable] = None) -> List[Dict]:
     """Map aligned (normalized) words back onto *text*'s surface tokens.
 
     *aligned* is the pipeline's own word list: dicts with ``text``,
-    ``start`` and ``end``, in the order MFA emitted them -- which is the
-    order of ``transcript_words(text)``, since that is exactly the
-    transcript it was given.
+    ``start`` and ``end``, in the order MFA emitted them.
 
-    Returns Govorim-shaped word entries: ``{"word", "begin", "end"}``, one
-    per surface token that actually has alignment behind it. Tokens that
-    normalize to nothing (a bare dash, a standalone number) are skipped:
-    MFA never saw them, so there is no honest timing to report.
+    The two sequences are matched with difflib rather than walked in
+    lockstep, because in practice they are NOT the same sequence. Audio and
+    book disagree in every direction: the narrator reads a title card, a
+    dedication or a translator's note that is nowhere in the FB2; the FB2
+    carries footnote text, an editor's preface or a different edition's
+    wording that is nowhere in the audio; and MFA silently emits nothing at
+    all for an utterance it could not align, leaving a hole of a hundred
+    words in the middle. A lockstep walk with a small look-ahead window
+    survives none of these -- past a hole it re-syncs on the first
+    coincidentally equal word (in Russian text, some short function word a
+    few sentences later), and everything after that inherits the skew,
+    which is far worse than having no timing at all.
+
+    difflib finds the longest matching blocks instead, so unmatched
+    stretches on either side are simply left unmatched. Tokens with no
+    alignment behind them get no entry: there is no honest timing to
+    report, and the reader shows them unhighlighted rather than wrong.
+
+    Returns Govorim-shaped word entries -- ``{"word", "begin", "end"}`` --
+    each carrying an internal ``_token`` index so build_chapter can regroup
+    them into sentences without assuming every token was matched.
+    attach_timings() is the public form, without that index.
     """
+    norm, owner, tokens = _normalized_index(text)
+    mfa = [str(w.get("text", "")) for w in aligned]
+    if not norm or not mfa:
+        if log and norm:
+            log("  Note: no aligned words for this chapter; it will have no "
+                "timings.")
+        return []
+
+    # autojunk would treat any word appearing in more than 1% of a long
+    # sequence as noise -- in Russian prose that is exactly the common
+    # function words ("и", "в", "не") that anchor a match.
+    matcher = difflib.SequenceMatcher(None, norm, mfa, autojunk=False)
+
+    # Per surface token, the aligned entries that matched its pieces.
+    spans: Dict[int, List[Dict]] = {}
+    matched = 0
+    for i, j, size in matcher.get_matching_blocks():
+        for k in range(size):
+            spans.setdefault(owner[i + k], []).append(aligned[j + k])
+            matched += 1
+
     out: List[Dict] = []
-    i = 0
-    n = len(aligned)
-    resyncs = 0
-    dropped = 0
-
-    for token in surface_tokens(text):
-        expected = _expected_norm(token)
-        if not expected:
-            continue  # punctuation/number-only: never went to MFA
-        if i >= n:
-            dropped += 1
-            continue
-
-        spans: List[Dict] = []
-        for want in expected:
-            if i >= n:
-                break
-            got = aligned[i]
-            if str(got.get("text", "")) != want:
-                # Look a short way ahead for the word we expected. If it's
-                # there, the aligner dropped something in between, so skip
-                # past the gap and carry on.
-                found = None
-                for k in range(i + 1, min(i + 1 + _RESYNC_WINDOW, n)):
-                    if str(aligned[k].get("text", "")) == want:
-                        found = k
-                        break
-                if found is None:
-                    # This token has no alignment at all: the aligner never
-                    # emitted it. Give up on THIS token without consuming an
-                    # entry -- consuming one here would hand this token the
-                    # next token's timing, and every later word in the
-                    # chapter would inherit that one-word skew.
-                    break
-                i = found
-                got = aligned[i]
-                resyncs += 1
-            spans.append(got)
-            i += 1
-
-        if not spans:
-            dropped += 1
-            continue
+    for ti in sorted(spans):
+        entries = spans[ti]
         out.append({
-            "word": token,
-            "begin": round(float(spans[0]["start"]), 3),
-            "end": round(float(spans[-1]["end"]), 3),
+            "word": tokens[ti],
+            "begin": round(float(entries[0]["start"]), 3),
+            "end": round(float(entries[-1]["end"]), 3),
+            "_token": ti,
         })
 
-    if log and (resyncs or dropped):
-        log(f"  Note: {resyncs} alignment re-sync(s), {dropped} token(s) "
-            f"with no timing while building Govorim word list "
-            f"({len(out)} words kept).")
+    if log:
+        coverage = matched / len(norm)
+        unused = len(mfa) - matched
+        note = (f"  Matched {matched}/{len(norm)} of the chapter's words to "
+                f"the audio ({coverage:.0%})")
+        if unused:
+            note += f"; {unused} aligned word(s) had no counterpart in the text"
+        log(note + ".")
+        if coverage < _LOW_COVERAGE:
+            log(f"  Warning: only {coverage:.0%} of this chapter has timings. "
+                f"Usually the recording and this edition of the text differ "
+                f"(an abridgement, a spoken preface, endnotes read aloud), or "
+                f"the chapter is paired to the wrong audio file.")
     return out
+
+
+def _public_word(entry: Dict) -> Dict:
+    """The Govorim-visible fields of a word entry, without bookkeeping."""
+    return {"word": entry["word"], "begin": entry["begin"], "end": entry["end"]}
+
+
+def attach_timings(text: str, aligned: Sequence[Dict],
+                   log: Optional[callable] = None) -> List[Dict]:
+    """Timings for *text*'s surface tokens, one entry per token that has
+    alignment behind it. See _attach_indexed for how the mapping is made."""
+    return [_public_word(w) for w in _attach_indexed(text, aligned, log=log)]
 
 
 def build_chapter(text: str, aligned: Sequence[Dict], audio_url: str,
@@ -164,22 +202,24 @@ def build_chapter(text: str, aligned: Sequence[Dict], audio_url: str,
     that was fed to the aligner, before fb2.transcript_words stripped it.
     *aligned* is the pipeline's word list for that chapter.
     """
-    words = attach_timings(text, aligned, log=log)
+    words = _attach_indexed(text, aligned, log=log)
+    by_token = {w["_token"]: w for w in words}
 
-    # Regroup into sentence fragments. Both the flat token list above and
-    # the per-sentence lists below come from splitting the SAME text on
-    # whitespace, and the sentence split only ever cuts at whitespace, so
-    # walking the sentences in order consumes the flat list exactly.
+    # Regroup into sentence fragments. Sentences are cut out of the SAME
+    # text on whitespace only, so their tokens partition the token list in
+    # order and each sentence owns a known index range. Indexing by range
+    # rather than walking a counter is what lets a token with no timing be
+    # missing from `words` entirely: with a counter, one unmatched token
+    # would shift every later sentence onto the wrong words.
     fragments: List[Dict] = []
-    idx = 0
+    cursor = 0
     for sentence in split_sentences(text):
-        count = sum(1 for t in surface_tokens(sentence) if _expected_norm(t))
-        if not count:
-            continue
-        chunk = words[idx:idx + count]
-        idx += count
+        lo = cursor
+        cursor += len(surface_tokens(sentence))
+        chunk = [_public_word(by_token[t]) for t in range(lo, cursor)
+                 if t in by_token]
         if not chunk:
-            continue
+            continue    # nothing in this sentence aligned; no honest timing
         fragments.append({
             "text": sentence,
             "begin": chunk[0]["begin"],
@@ -191,7 +231,7 @@ def build_chapter(text: str, aligned: Sequence[Dict], audio_url: str,
         "audio_url": audio_url,
         "narrator": narrator,
         "fragments": fragments,
-        "word_timings": words,
+        "word_timings": [_public_word(w) for w in words],
     }
 
 

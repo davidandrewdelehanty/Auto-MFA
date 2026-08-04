@@ -48,6 +48,16 @@ DEFAULT_RETRY_BEAM = 400
 # reported as such instead of quietly producing a mangled book.
 MIN_ALIGNED_RATIO = 0.90
 
+# Below this, stop and say so rather than shipping the result. A run this
+# empty is not a text that merely disagrees with the recording in places --
+# it is the wrong audio paired to the wrong chapter, a corrupt file, or a
+# missing pronunciation dictionary, and the few "timings" it produces would
+# be noise. Between this and MIN_ALIGNED_RATIO the run continues and warns:
+# a narrator who reads a title card, an edition whose footnotes are absent
+# from the recording, or a chapter the reader abridges all leave stretches
+# with no alignment, and partial timings beat none.
+ABORT_ALIGNED_RATIO = 0.10
+
 
 @dataclass
 class Pair:
@@ -658,13 +668,40 @@ def write_govorim(results: List[Dict], output_dir: Path, slug: str,
     return written
 
 
+def export_chapter_audio(results: List[Dict], dest_dir: Path,
+                        log: LogFn) -> List[Path]:
+    """Copy out the per-chapter MP3 clips cut from a multi-chapter pair.
+
+    Those clips are cut into the run's temp directory, which is deleted as
+    soon as the run finishes. write_zip picks them up because it runs while
+    the temp dir still exists; the Govorim path writes loose JSON files
+    instead, and without this their audio_url would point at chapter audio
+    that exists nowhere. A one-file-per-chapter pair has no clip -- its
+    audio is the user's own file, already on disk.
+    """
+    written: List[Path] = []
+    for result in results:
+        src = result.get("_audio_path")
+        if not src or not Path(src).exists():
+            continue
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / result["audio_file"]
+        shutil.copyfile(src, dest)
+        written.append(dest)
+    if written:
+        log(f"Wrote {len(written)} chapter audio clip(s) to {dest_dir}")
+    return written
+
+
 def _missing_textgrids(alignment_dir: Path, jobs: List[CorpusJob]) -> List[CorpusJob]:
     return [j for j in jobs
             if not (Path(alignment_dir) / f"{Path(j.wav).stem}.TextGrid").exists()]
 
 
-def _enough_aligned(aligned: int, total: int) -> bool:
-    """Whether *aligned* of *total* segments clears MIN_ALIGNED_RATIO.
+def _enough_aligned(aligned: int, total: int,
+                    ratio: float = MIN_ALIGNED_RATIO) -> bool:
+    """Whether *aligned* of *total* segments clears *ratio*.
 
     The epsilon is load-bearing: written the obvious way, one miss out of
     ten fails a 90% threshold, because 10 * (1 - 0.90) is 0.9999999999999998
@@ -672,7 +709,7 @@ def _enough_aligned(aligned: int, total: int) -> bool:
     """
     if total <= 0:
         return False
-    return aligned >= total * MIN_ALIGNED_RATIO - 1e-9
+    return aligned >= total * ratio - 1e-9
 
 
 def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
@@ -746,21 +783,28 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
 
         aligned = len(jobs) - len(missing)
         ratio = aligned / len(jobs) if jobs else 0.0
-        if not _enough_aligned(aligned, len(jobs)):
+        if not _enough_aligned(aligned, len(jobs), ABORT_ALIGNED_RATIO):
             raise RuntimeError(
                 f"Only {aligned}/{len(jobs)} segments aligned ({ratio:.0%}) "
-                f"even after retrying with a wider beam. That is too low to "
-                f"produce usable timings.\n\n"
-                f"The usual cause is a transcript that doesn't match the "
-                f"audio: a preamble or endnotes section in the FB2 that "
-                f"isn't read aloud, an abridged recording, or the wrong "
-                f"chapter paired to a file. Check the pairing, and check "
-                f"whether this FB2 contains sections the narrator skips."
+                f"even after retrying with a wider beam. At that level there "
+                f"is nothing usable to salvage.\n\n"
+                f"This is not the ordinary case of a text that disagrees "
+                f"with the recording here and there -- that still produces "
+                f"timings for the parts that do match. A number this low "
+                f"means the wrong audio is paired to the chapter, the file "
+                f"is corrupt, or the pronunciation dictionary is missing."
             )
         if missing:
-            log(f"Note: {len(missing)}/{len(jobs)} segments could not be "
-                f"aligned ({ratio:.1%} aligned). Their words are left out; "
-                f"surrounding timings are unaffected.")
+            level = "Warning" if not _enough_aligned(aligned, len(jobs)) else "Note"
+            log(f"{level}: {len(missing)}/{len(jobs)} segments could not be "
+                f"aligned ({ratio:.1%} aligned). Those stretches get no "
+                f"timings and stay unhighlighted in the app; the segments "
+                f"around them are unaffected.")
+            if level == "Warning":
+                log("  A shortfall this size usually means the recording and "
+                    "this edition of the text genuinely differ -- a spoken "
+                    "title card or dedication, endnotes read aloud (or not), "
+                    "an abridgement. Continuing with what did align.")
         progress(0.9, "building JSON")
         results = postprocess(alignment_dir, pairs, jobs, log,
                               work_dir=work_dir, ffmpeg=ffmpeg)
@@ -768,6 +812,8 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
             raise RuntimeError("Alignment produced no output.")
         if govorim_slug:
             write_govorim(results, output_dir, govorim_slug, r2_folder, log)
+            # Must happen before the finally: below wipes work_dir.
+            export_chapter_audio(results, output_dir / "audio", log)
             progress(1.0, "done")
             return output_dir
         zip_path = output_dir / (zip_name or default_zip_name(output_dir))

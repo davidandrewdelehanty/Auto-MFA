@@ -129,9 +129,6 @@ _ROMAN_HOMOGLYPHS = str.maketrans({
 _CHAPTER_MARK_RE = re.compile(r"^(?:глава\s+)?([ivxlcdm]+)\.?(?:\s+\S.*)?$",
                               re.IGNORECASE | re.DOTALL)
 
-# Tags that carry readable text inside a section.
-_TEXT_TAGS = ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td")
-
 # A split is only believable if the pieces are chapter-sized. Verse works
 # number their STANZAS with roman numerals in exactly the same way prose
 # works number their chapters: Eugene Onegin has 391 such subtitles, and
@@ -140,6 +137,20 @@ _TEXT_TAGS = ("p", "v", "subtitle", "stanza", "cite", "text-author", "th", "td")
 # Karenina, 4172 in Crime and Punishment, minimum 212), so a median below
 # this means the markers were numbering something else.
 _MIN_MEDIAN_CHAPTER_WORDS = 150
+
+
+# Endnote sections. FB2 normally puts these in <body name="notes">, which is
+# skipped outright, but plenty of files leave them as an ordinary section of
+# the main body -- Crime and Punishment ships 273 numbered notes that way.
+# They are never recorded, so they must not become a chapter and shift every
+# later chapter's pairing by one.
+_NOTES_TITLE_RE = re.compile(
+    r"^(сноски?|примечани[ея]|комментари[ий]|notes?|footnotes?|endnotes?)\W*$",
+    re.IGNORECASE)
+
+
+def _is_notes_title(title: str) -> bool:
+    return bool(_NOTES_TITLE_RE.match((title or "").strip()))
 
 
 def _chapter_marker(text: str) -> str:
@@ -160,23 +171,11 @@ def _chapter_marker(text: str) -> str:
 
 def _text_from(elements) -> str:
     """Readable text of *elements*, not descending into nested sections."""
-    parts: List[str] = []
-
-    def take(elem: ET.Element) -> None:
-        tag = _localname(elem.tag)
-        if tag == "section":
-            return
-        if tag in _TEXT_TAGS:
-            text = "".join(elem.itertext()).strip()
-            if text:
-                parts.append(text)
-            return
-        for child in elem:
-            take(child)
-
+    holder = ET.Element("holder")
     for elem in elements:
-        take(elem)
-    return " ".join(parts)
+        holder.append(elem)   # borrowed, not moved -- ElementTree keeps no
+                              # parent links, so the original tree is intact
+    return _gather(holder, skip_sections=True)
 
 
 def _split_leaf_on_subtitles(section: ET.Element, title: str,
@@ -262,14 +261,40 @@ def _walk_sections(section: ET.Element, chapters: List[Dict[str, str]]) -> None:
     """
     nested = [c for c in section if _localname(c.tag) == "section"]
     title = _section_title(section)
+    if _is_notes_title(title):
+        return                        # endnotes left in the main body
+
+    # Nesting only counts as chapter structure when the subsections are
+    # chapters in their own right, which in practice means they are titled.
+    # Where a large share of them are not, the nesting is internal division:
+    # "Моя любимая страна" builds each of its 14 essays from an untitled
+    # first-person opening plus the titled reportage piece it introduces, and
+    # splitting there gives 28 half-chapters against 14 audio files. A stray
+    # untitled section among many titled ones is just an untitled chapter
+    # (Тихий Дон has three among 248), hence a share rather than a flat
+    # "every one of them".
+    #
+    # The test only applies where the subsections are leaves. A subsection
+    # holding subsections of its own is structural whatever its title says --
+    # Тихий Дон's "КНИГА ТРЕТЬЯ" wraps two untitled parts holding 63 chapters
+    # between them, and judging it by this rule would swallow all 63.
+    if nested and not any(any(_localname(g.tag) == "section" for g in c) for c in nested):
+        if sum(1 for c in nested if not _section_title(c)) * 3 > len(nested):
+            nested = []
+
     if not nested:
         # A part-in-one-section book marks its chapters with <subtitle>;
         # split on those when present (see _split_leaf_on_subtitles).
         if _split_leaf_on_subtitles(section, title, chapters):
             return
         text = _collect_text(section).strip()
-        if text:
-            chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
+        if not text:
+            return
+        # An untitled scrap this short is front matter -- a dedication, an
+        # epigraph, a colophon -- not a chapter anyone recorded.
+        if not title and len(text.split()) < _MIN_MEDIAN_CHAPTER_WORDS:
+            return
+        chapters.append({"title": title or f"Chapter {len(chapters) + 1}", "text": text})
         return
 
     # Walk the subsections into a scratch list first, so their combined size
