@@ -22,6 +22,23 @@ from .textgrid import parse_textgrid
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float, str], None]
 
+# Beam widths used on the FIRST alignment pass, not just as a retry.
+#
+# MFA's defaults (beam 10 / retry_beam 40) assume a transcript that matches
+# its audio closely. This app cuts a chapter at detected silences and then
+# splits the text across those pieces *proportionally by duration* -- a
+# principled guess, but a guess: a segment's transcript can start or end a
+# few words off from what is actually spoken in it. That is exactly the
+# condition a narrow beam rejects, and a rejected utterance produces no
+# output file while MFA still reports success.
+#
+# Measured on a 29-segment chapter: default beam aligned 5/29; beam 100 /
+# retry_beam 400 aligned 28/29. The wider beam costs roughly 4x on the
+# alignment step alone, but a failed pass costs the whole run, so starting
+# wide is cheaper in wall-clock as well as far more reliable.
+DEFAULT_BEAM = 100
+DEFAULT_RETRY_BEAM = 400
+
 # Share of segments that must align for a run to be considered usable.
 # MFA leaves a small number of utterances unaligned as a matter of course
 # (beam failures where audio and transcript diverge locally) -- chasing
@@ -694,7 +711,8 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         progress(0.0, "aligning")
         book_dict = build_dictionary(corpus_dir, dictionary, work_dir, log)
         run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
-                     log, num_jobs=num_jobs, dictionary_path=book_dict)
+                     log, num_jobs=num_jobs, dictionary_path=book_dict,
+                     beam=DEFAULT_BEAM, retry_beam=DEFAULT_RETRY_BEAM)
         # An utterance MFA cannot align produces NO output file, and MFA
         # still reports the run as fully successful -- so "fewer files than
         # expected" is the only signal that anything went wrong. A small
@@ -703,14 +721,15 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         # always out-of-vocabulary words with no pronunciation, which
         # build_dictionary above exists to prevent.
         #
-        # Widening the beam is MFA's documented remedy for the leftovers,
-        # so retry the whole pass with a wider beam before giving up, then
-        # once more single-job (which also covers the memory-pressure case,
-        # since an OOM-killed job likewise just leaves files missing).
+        # The first pass already runs wide (see DEFAULT_BEAM), so a
+        # shortfall here means the leftovers need wider still.
         missing = _missing_textgrids(alignment_dir, jobs)
         tiers = [
-            {"beam": 100, "retry_beam": 400, "num_jobs": num_jobs},
-            {"beam": 100, "retry_beam": 400, "num_jobs": 1},
+            # Wider still, and single-job -- which also covers the
+            # memory-pressure case, since an OOM-killed job likewise just
+            # leaves output missing.
+            {"beam": DEFAULT_BEAM * 2, "retry_beam": DEFAULT_RETRY_BEAM * 2,
+             "num_jobs": 1},
         ]
         for tier in tiers:
             if _enough_aligned(len(jobs) - len(missing), len(jobs)):

@@ -33,6 +33,7 @@ There are no ``phones`` in Govorim's schema; that tier is dropped here.
 
 import re
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import quote
 
 from .fb2 import transcript_words
 
@@ -198,14 +199,21 @@ def audio_url_for(audio_name: str, r2_folder: str = "",
                   base: str = DEFAULT_R2_BASE) -> str:
     """Build the public audio URL for one track.
 
-    With no *r2_folder*, returns just the filename -- the caller is
-    expected to rewrite it when the audio actually gets uploaded.
+    The filename is percent-encoded. Russian audiobook files routinely
+    arrive named in Cyrillic and with spaces ("мраморная головка
+    аудиокнига.mp3"); dropped into a URL raw, that is not a valid URL, and
+    whether it resolves depends on the client. Encoding it here means the
+    stored URL is correct whatever the file is called. ASCII names like
+    "44.mp3" are unaffected.
+
+    With no *r2_folder*, returns just the filename unencoded -- it isn't a
+    URL yet, and the install step rewrites it once the R2 folder is known.
     """
     name = str(audio_name).strip()
     folder = (r2_folder or "").strip().strip("/")
     if not folder:
         return name
-    return f"{base.rstrip('/')}/{folder}/{name}"
+    return f"{base.rstrip('/')}/{quote(folder)}/{quote(name)}"
 
 
 def chapter_filename(slug: str, index: int) -> str:

@@ -26,8 +26,8 @@ from pathlib import Path
 from unittest import mock
 
 from app.pipeline import (
-    CorpusJob, Pair, build_dictionary, model_present, postprocess,
-    prepare_corpus, run_alignment, run_pipeline, write_zip,
+    DEFAULT_BEAM, CorpusJob, Pair, build_dictionary, model_present,
+    postprocess, prepare_corpus, run_alignment, run_pipeline, write_zip,
 )
 from app import audio as audio_mod
 
@@ -521,22 +521,22 @@ class UnalignedSegmentsTest(unittest.TestCase):
         self.assertTrue(result.exists())
         self.assertEqual(len(calls), 1, "should not retry a tolerable miss")
 
-    def test_widens_the_beam_when_many_segments_fail(self):
-        # Only the wider beam gets everything aligned.
-        result, calls = self._run(
-            lambda jobs, beam: jobs if beam else jobs[:3])
+    def test_first_pass_already_uses_a_wide_beam(self):
+        """Measured: the default beam aligned 5/29 on a real chapter, a
+        wide beam 28/29. Our text split is proportional (a guess), so wide
+        is the normal case -- starting narrow just buys a wasted pass."""
+        result, calls = self._run(lambda jobs, beam: jobs)
         self.assertTrue(result.exists())
-        self.assertEqual(calls[0][1], None)      # first pass: default beam
-        self.assertEqual(calls[1][1], 100)       # retry: widened
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], DEFAULT_BEAM)
 
-    def test_escalates_to_single_job_if_the_wider_beam_is_not_enough(self):
+    def test_escalates_wider_and_single_job_when_still_short(self):
+        # Only a beam wider than the default first pass finishes the job.
         result, calls = self._run(
-            lambda jobs, beam: jobs if beam and len(jobs) else jobs[:3],
+            lambda jobs, beam: jobs if beam > DEFAULT_BEAM else jobs[:3],
             n_jobs=10)
-        # tiers are (num_jobs as configured, beam), then (1, beam)
-        self.assertEqual(calls[0], (2, None))
-        self.assertEqual(calls[1], (2, 100))
+        self.assertEqual(calls[0], (2, DEFAULT_BEAM))
+        self.assertEqual(calls[1], (1, DEFAULT_BEAM * 2))
         self.assertTrue(result.exists())
 
     def test_raises_with_a_useful_message_when_almost_nothing_aligns(self):

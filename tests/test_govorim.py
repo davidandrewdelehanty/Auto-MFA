@@ -160,6 +160,19 @@ class AudioUrlTest(unittest.TestCase):
             f"{govorim.DEFAULT_R2_BASE}/dama/01.mp3",
         )
 
+    def test_percent_encodes_cyrillic_and_spaces(self):
+        """Russian audiobook files arrive named like "мраморная головка
+        аудиокнига.mp3". Raw in a URL that is not valid, and whether it
+        resolves depends on the client."""
+        url = govorim.audio_url_for("мраморная головка.mp3", "marble-head")
+        self.assertNotIn(" ", url)
+        self.assertIn("%20", url)
+        self.assertTrue(url.startswith(f"{govorim.DEFAULT_R2_BASE}/marble-head/"))
+
+    def test_ascii_names_are_left_readable(self):
+        self.assertEqual(govorim.audio_url_for("44.mp3", "anna-karenina"),
+                         f"{govorim.DEFAULT_R2_BASE}/anna-karenina/44.mp3")
+
     def test_chapter_filename_is_zero_padded(self):
         self.assertEqual(govorim.chapter_filename("chekhov-dama", 1),
                          "chekhov-dama-ch001.json")

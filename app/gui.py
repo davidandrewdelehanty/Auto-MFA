@@ -32,6 +32,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__
 from .fb2 import (extract_chapters, extract_metadata, find_audio_files,
                   find_fb2, transcript_words)
+from .govorim import DEFAULT_R2_BASE
 from .scriptgen import (build_install_script, build_script,
                         build_upload_script, run_command_for, slugify,
                         to_wsl_path)
@@ -642,6 +643,8 @@ class AutoMfaApp(tk.Tk):
                     json_src_dir_wsl=to_wsl_path(dest),
                     title=self.book_title.get().strip(),
                     author=self.book_author.get().strip(),
+                    r2_folder=self.r2_folder.get().strip(),
+                    r2_base=DEFAULT_R2_BASE,
                     version=__version__,
                 ),
                 encoding="utf-8", newline="\n")

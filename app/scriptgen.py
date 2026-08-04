@@ -122,6 +122,8 @@ def build_install_script(slug: str, repo_dir_wsl: str, fb2_src_wsl: str,
                          author: str = "", category: str = "Works",
                          narrator: str = "audiobook",
                          source_note: str = "owned recording",
+                         r2_folder: str = "",
+                         r2_base: str = "",
                          version: str = "") -> str:
     """Script that installs a finished book into the Govorim app.
 
@@ -164,7 +166,10 @@ AUTHOR={shell_quote(author)}
 CATEGORY={shell_quote(category)}
 NARRATOR={shell_quote(narrator)}
 SOURCE_NOTE={shell_quote(source_note)}
+R2_FOLDER={shell_quote(r2_folder)}
+R2_BASE={shell_quote(r2_base)}
 export REPO FB2 JSON_SRC SLUG TITLE AUTHOR CATEGORY NARRATOR SOURCE_NOTE
+export R2_FOLDER R2_BASE
 
 if [ ! -d "$REPO/public/books" ]; then
     echo "Not a Govorim checkout: $REPO" >&2
@@ -186,6 +191,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from urllib.parse import quote
 
 repo = Path(os.environ["REPO"])
 slug = os.environ["SLUG"]
@@ -225,12 +231,35 @@ if not found:
 for stale in audio_dir.glob("*.json"):
     stale.unlink()
 
+# audio_url is written when the chapter JSON is generated, from the R2
+# folder set in the GUI. If that was left blank the URL is a bare
+# filename, which 404s in the app -- so repair it here rather than making
+# anyone re-run a multi-minute alignment just to change a string.
+r2_folder = os.environ.get("R2_FOLDER", "").strip().strip("/")
+r2_base = os.environ.get("R2_BASE", "").rstrip("/")
+
 chapters = []
+fixed_urls = 0
 for i, src in enumerate(found, start=1):
     dest = audio_dir / f"{{i:03d}}.json"
-    shutil.copyfile(src, dest)
+    doc = json.loads(src.read_text(encoding="utf-8"))
+    url = str(doc.get("audio_url", ""))
+    if r2_folder and r2_base and not url.startswith(("http://", "https://")):
+        # Percent-encode: these filenames are routinely Cyrillic with
+        # spaces, which is not valid in a URL as-is.
+        name = quote(url.rsplit("/", 1)[-1])
+        doc["audio_url"] = f"{{r2_base}}/{{quote(r2_folder)}}/{{name}}"
+        fixed_urls += 1
+    dest.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
     chapters.append(f"audio/{{slug}}/{{dest.name}}")
 print(f"chapters -> public/books/audio/{{slug}}/  ({{len(chapters)}} file(s))")
+if fixed_urls:
+    print(f"audio_url -> pointed {{fixed_urls}} chapter(s) at {{r2_folder}}/")
+elif not str(json.loads(found[0].read_text(encoding='utf-8'))
+             .get("audio_url", "")).startswith(("http://", "https://")):
+    print("WARNING: audio_url is a bare filename and no R2 folder was set -- "
+          "the audio will not load until those URLs are fixed.")
 
 # 3. The catalogue entry. index.json is a list; the manifest generator
 # preserves hand-set fields on existing entries, so anything set here (or
