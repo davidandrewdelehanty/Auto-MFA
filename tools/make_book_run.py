@@ -27,7 +27,7 @@ them.
 import argparse
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -38,10 +38,22 @@ from app import __version__  # noqa: E402
 
 def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
           title: str = "", author: str = "", narrator: str = "audiobook",
-          num_jobs: int = 2) -> Path:
+          num_jobs: int = 2, as_folder: str = "",
+          project: str = "") -> Path:
+    """Generate the run for the book in *folder*.
+
+    *as_folder*, when given, is the path written INTO the generated scripts
+    in place of *folder*: it lets the run be generated on one machine from
+    a copy of the book folder and executed on another, where the same book
+    lives at a different path. Everything else is read from *folder* as
+    normal, so the chapter list and the file names still come from the real
+    book rather than being taken on trust. *project* does the same for this
+    Auto-MFA checkout's own path, which the alignment script has to cd into.
+    """
     fb2_path = fb2.find_fb2(folder)
     chapters = fb2.extract_chapters(fb2_path)
     audio = fb2.find_audio_files(folder)
+    src_dir = PurePosixPath(as_folder) if as_folder else folder
 
     if len(audio) != len(chapters):
         raise SystemExit(
@@ -89,7 +101,7 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     list_path = out / "upload_list.txt"
     list_path.write_text("\n".join(staged) + "\n", encoding="utf-8")
 
-    project = str(Path(__file__).resolve().parent.parent)
+    project = project or str(Path(__file__).resolve().parent.parent)
     (out / f"align_{slug}.sh").write_text(
         scriptgen.build_script(slug, str(job_path), project, __version__),
         encoding="utf-8")
@@ -99,7 +111,7 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
         encoding="utf-8")
     (out / f"install_{slug}.sh").write_text(
         scriptgen.build_install_script(
-            slug, repo, str(fb2_path), str(json_dir), title=title,
+            slug, repo, str(src_dir / fb2_path.name), str(json_dir), title=title,
             author=author, narrator=narrator, r2_folder=r2_folder,
             r2_base=DEFAULT_R2_BASE, version=__version__),
         encoding="utf-8")
@@ -107,7 +119,7 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     # Staging is a script step rather than something done here: it copies
     # gigabytes, and it belongs in the same log as everything else.
     copies = "\n".join(
-        f"cp -n {scriptgen.shell_quote(str(src))} \"$STAGE\"/{name}"
+        f"cp -n {scriptgen.shell_quote(str(src_dir / src.name))} \"$STAGE\"/{name}"
         for src, name in zip(audio, staged))
 
     run_path = out / f"run_{slug}.sh"
@@ -186,10 +198,17 @@ def main() -> int:
     ap.add_argument("--author", default="")
     ap.add_argument("--narrator", default="audiobook")
     ap.add_argument("--num-jobs", type=int, default=2)
+    ap.add_argument("--as-folder", default="",
+                    help="path to write into the generated scripts instead "
+                         "of --folder (for generating on one machine and "
+                         "running on another)")
+    ap.add_argument("--project", default="",
+                    help="path of the Auto-MFA checkout on the machine that "
+                         "will RUN the scripts (defaults to this one)")
     a = ap.parse_args()
     build(Path(a.folder), a.slug, a.r2_folder, a.repo, Path(a.work),
           title=a.title, author=a.author, narrator=a.narrator,
-          num_jobs=a.num_jobs)
+          num_jobs=a.num_jobs, as_folder=a.as_folder, project=a.project)
     return 0
 
 
