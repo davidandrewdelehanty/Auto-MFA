@@ -209,5 +209,11 @@ def audio_url_for(audio_name: str, r2_folder: str = "",
 
 
 def chapter_filename(slug: str, index: int) -> str:
-    """``<slug>-chNN.json``, matching how Govorim's repo already names these."""
-    return f"{slug}-ch{index:02d}.json"
+    """``<slug>-ch001.json``.
+
+    Three digits, always. Two would sort wrongly for any book with more
+    than 99 chapters -- "ch100" collates before "ch99" -- and this library
+    contains several (Anna Karenina 239, War and Peace 362). The install
+    step renames these to the app's own ``NNN.json`` convention anyway.
+    """
+    return f"{slug}-ch{index:03d}.json"

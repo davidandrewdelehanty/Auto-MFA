@@ -293,6 +293,7 @@ python app/main.py --worker align /path/to/align_<slug>.job.json
 app/
   main.py        entry point (GUI, or --worker mode)
   gui.py         Tkinter GUI: folder picker, pairing, options, script output
+                 (three generators: align, upload to R2, install into Govorim)
   scriptgen.py   WSL path translation, slugs, generated bash script (no Tk,
                  so it is unit-testable without a display)
   govorim.py     Govorim JSON format: surface-form remapping, sentence
@@ -312,7 +313,36 @@ build.ps1        Windows build; use -SkipRuntime (the GUI needs only tkinter)
 setup_wsl.sh     WSL/Linux setup: creates the conda env with MFA in it
 align_<slug>.sh  generated per book by the GUI; what you actually run
 upload_<f>.sh    generated per book; rclone-uploads the audio to R2
+install_<s>.sh   generated per book; installs it into the Govorim app
 ```
+
+## Installing into the Govorim app
+
+**Generate install script** writes `install_<slug>.sh`, which puts a finished
+book where the app expects it:
+
+| | |
+|---|---|
+| FB2 | `public/books/novel/<slug>.fb2` |
+| chapters | `public/books/audio/<slug>/001.json`, `002.json`, … |
+| catalogue | an entry in `public/books/index.json` with an ordered `audiobook.chapters` list |
+
+The catalogue entry is the part worth understanding: **the app does not glob
+the audio folder.** `index.json` lists each chapter path explicitly, in order,
+and a chapter that isn't listed doesn't exist as far as the reader is
+concerned. That's also why the chapter files are renamed from this tool's
+`<slug>-chNNN.json` to the app's own `NNN.json` convention on the way in.
+
+The JSON edit is done in Python inside the script — a real parse-modify-write,
+so every other book's entry and any hand-curated title/author survive. Chapter
+ordering comes from numeric sorting, not shell glob collation, because `ch100`
+collates before `ch99` as text and this library has books with 239 and 362
+chapters.
+
+Re-running replaces this book's files and entry and leaves everything else
+alone, including clearing out chapters from a previous longer run so no orphan
+files are left behind. `index.json` is backed up to `index.json.bak` before the
+first write.
 
 ## Uploading audio to R2
 

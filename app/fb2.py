@@ -140,6 +140,43 @@ def extract_chapters(path: Path) -> List[Dict[str, str]]:
     return chapters
 
 
+def extract_metadata(path: Path) -> Dict[str, str]:
+    """Return {"title", "author"} from an FB2's <title-info> block.
+
+    Used to prefill the catalogue entry when installing a book into the
+    Govorim app, so the title reads "Дама с собачкой" rather than a
+    slug-derived guess like "Chekhov Dama". Both keys are always present
+    and may be empty -- FB2 metadata is frequently incomplete, and a
+    missing title is not worth failing over.
+    """
+    title = ""
+    author = ""
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:  # noqa: BLE001
+        return {"title": "", "author": ""}
+
+    for info in root.iter():
+        if _localname(info.tag) != "title-info":
+            continue
+        for child in info:
+            name = _localname(child.tag)
+            if name == "book-title" and not title:
+                title = "".join(child.itertext()).strip()
+            elif name == "author" and not author:
+                parts = []
+                for field in ("first-name", "middle-name", "last-name"):
+                    for sub in child:
+                        if _localname(sub.tag) == field:
+                            value = "".join(sub.itertext()).strip()
+                            if value:
+                                parts.append(value)
+                            break
+                author = " ".join(parts)
+        break
+    return {"title": title, "author": author}
+
+
 def transcript_words(text: str) -> List[str]:
     """Normalize chapter text into the word list MFA expects in a transcript.
 

@@ -18,10 +18,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import shutil
+import subprocess
+
 from app import govorim
+from app.fb2 import extract_metadata
 from app.pipeline import CorpusJob, Pair, run_pipeline, write_govorim
-from app.scriptgen import (build_script, build_upload_script, run_command_for,
-                           shell_quote, slugify, to_wsl_path)
+from app.scriptgen import (build_install_script, build_script,
+                           build_upload_script, run_command_for, shell_quote,
+                           slugify, to_wsl_path)
 
 
 def aligned(*pairs):
@@ -157,9 +162,16 @@ class AudioUrlTest(unittest.TestCase):
 
     def test_chapter_filename_is_zero_padded(self):
         self.assertEqual(govorim.chapter_filename("chekhov-dama", 1),
-                         "chekhov-dama-ch01.json")
+                         "chekhov-dama-ch001.json")
         self.assertEqual(govorim.chapter_filename("chekhov-dama", 12),
-                         "chekhov-dama-ch12.json")
+                         "chekhov-dama-ch012.json")
+
+    def test_chapter_filenames_sort_correctly_past_99(self):
+        """Two digits would collate "ch100" before "ch99" -- silently
+        reordering any book with more than 99 chapters (Anna Karenina has
+        239, War and Peace 362)."""
+        names = [govorim.chapter_filename("b", i) for i in range(1, 106)]
+        self.assertEqual(sorted(names), names)
 
 
 class WriteGovorimTest(unittest.TestCase):
@@ -174,7 +186,7 @@ class WriteGovorimTest(unittest.TestCase):
             written = write_govorim(results, Path(d), "test-book", "tb",
                                     log=lambda m: None)
             self.assertEqual([p.name for p in written],
-                             ["test-book-ch01.json", "test-book-ch02.json"])
+                             ["test-book-ch001.json", "test-book-ch002.json"])
             doc = json.loads(written[0].read_text(encoding="utf-8"))
             self.assertEqual(doc["audio_url"],
                              f"{govorim.DEFAULT_R2_BASE}/tb/01.mp3")
@@ -239,8 +251,8 @@ class PipelineGovorimModeTest(unittest.TestCase):
 
             self.assertEqual(result, out)
             produced = sorted(p.name for p in out.glob("*.json"))
-            self.assertEqual(produced, ["my-book-ch01.json"])
-            doc = json.loads((out / "my-book-ch01.json").read_text(encoding="utf-8"))
+            self.assertEqual(produced, ["my-book-ch001.json"])
+            doc = json.loads((out / "my-book-ch001.json").read_text(encoding="utf-8"))
             # Original punctuation/case preserved, NOT the normalized form.
             self.assertEqual([w["word"] for w in doc["word_timings"]],
                              ["Привет,", "мир!"])
@@ -378,6 +390,180 @@ class UploadScriptTest(unittest.TestCase):
     def test_remote_name_is_overridable(self):
         script = self._script()
         self.assertIn("AUTO_MFA_R2_REMOTE", script)
+
+
+FB2_WITH_META = """<?xml version="1.0" encoding="utf-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+ <description>
+  <title-info>
+   <author><first-name>Антон</first-name><last-name>Чехов</last-name></author>
+   <book-title>Дама с собачкой</book-title>
+  </title-info>
+ </description>
+ <body><section><title><p>Глава 1</p></title><p>Текст.</p></section></body>
+</FictionBook>
+"""
+
+
+class Fb2MetadataTest(unittest.TestCase):
+    """Title/author prefill the catalogue entry, so the book shows up in
+    the app as "Дама с собачкой" rather than a slug-derived guess."""
+
+    def _write(self, text):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = Path(d.name) / "b.fb2"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_reads_title_and_author(self):
+        meta = extract_metadata(self._write(FB2_WITH_META))
+        self.assertEqual(meta["title"], "Дама с собачкой")
+        self.assertEqual(meta["author"], "Антон Чехов")
+
+    def test_missing_metadata_is_not_an_error(self):
+        meta = extract_metadata(self._write(
+            '<?xml version="1.0"?><FictionBook><body><section>'
+            '<p>x</p></section></body></FictionBook>'))
+        self.assertEqual(meta, {"title": "", "author": ""})
+
+    def test_unparseable_file_is_not_an_error(self):
+        self.assertEqual(extract_metadata(self._write("not xml at all")),
+                         {"title": "", "author": ""})
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("python3"),
+                     "needs bash and python3 to execute the generated script")
+class InstallScriptTest(unittest.TestCase):
+    """Runs the generated installer for real against a synthetic Govorim
+    checkout. The install step has to get three things right at once (FB2
+    location, chapter naming, catalogue entry) and a mistake in any of
+    them produces a book that silently doesn't play -- so assert on the
+    resulting files, not on the script text.
+    """
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = Path(d.name)
+        self.repo = self.root / "repo"
+        self.books = self.repo / "public" / "books"
+        self.books.mkdir(parents=True)
+        self.src = self.root / "src"
+        self.src.mkdir()
+        (self.src / "book.fb2").write_text(FB2_WITH_META, encoding="utf-8")
+        # A book already in the catalogue, which must survive untouched.
+        self.index = self.books / "index.json"
+        self.index.write_text(json.dumps([{
+            "filename": "novel/other.fb2", "title": "Другая",
+            "category": "Works",
+            "audiobook": {"narrator": "audiobook", "source": "x",
+                          "chapters": ["audio/other/001.json"]},
+        }], ensure_ascii=False), encoding="utf-8")
+
+    def _chapters(self, n):
+        for i in range(1, n + 1):
+            (self.src / govorim.chapter_filename("mh", i)).write_text(
+                json.dumps({"audio_url": f"u{i}", "narrator": "audiobook",
+                            "fragments": [], "word_timings": []}),
+                encoding="utf-8")
+
+    def _install(self, **kw):
+        params = dict(slug="mh", repo_dir_wsl=str(self.repo),
+                      fb2_src_wsl=str(self.src / "book.fb2"),
+                      json_src_dir_wsl=str(self.src),
+                      title="Дама с собачкой", author="Антон Чехов",
+                      version="test")
+        params.update(kw)
+        script = self.root / "install.sh"
+        script.write_text(build_install_script(**params), encoding="utf-8",
+                          newline="\n")
+        proc = subprocess.run(["bash", str(script)], capture_output=True,
+                              text=True)
+        return proc
+
+    def _entry(self):
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        return next(e for e in data if e["filename"] == "novel/mh.fb2")
+
+    def test_installs_fb2_chapters_and_catalogue_entry(self):
+        self._chapters(3)
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue((self.books / "novel" / "mh.fb2").is_file())
+        names = sorted(p.name for p in (self.books / "audio" / "mh").glob("*.json"))
+        self.assertEqual(names, ["001.json", "002.json", "003.json"])
+
+        entry = self._entry()
+        self.assertEqual(entry["title"], "Дама с собачкой")
+        self.assertEqual(entry["author"], "Антон Чехов")
+        self.assertEqual(entry["category"], "Works")
+        self.assertEqual(entry["audiobook"]["chapters"],
+                         ["audio/mh/001.json", "audio/mh/002.json",
+                          "audio/mh/003.json"])
+
+    def test_leaves_other_books_alone(self):
+        self._chapters(2)
+        self._install()
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        other = next(e for e in data if e["filename"] == "novel/other.fb2")
+        self.assertEqual(other["title"], "Другая")
+        self.assertEqual(other["audiobook"]["chapters"], ["audio/other/001.json"])
+        self.assertEqual(len(data), 2)
+
+    def test_chapter_order_survives_past_99(self):
+        """Lexicographic sorting would place ch100 before ch99, silently
+        reordering the book. 105 chapters exercises that."""
+        self._chapters(105)
+        self.assertEqual(self._install().returncode, 0)
+        chapters = self._entry()["audiobook"]["chapters"]
+        self.assertEqual(len(chapters), 105)
+        self.assertEqual(chapters[98], "audio/mh/099.json")
+        self.assertEqual(chapters[99], "audio/mh/100.json")
+        # ...and the CONTENT followed the number, not the collation order.
+        got = json.loads((self.books / "audio" / "mh" / "100.json")
+                         .read_text(encoding="utf-8"))
+        self.assertEqual(got["audio_url"], "u100")
+
+    def test_rerun_with_fewer_chapters_leaves_no_orphans(self):
+        self._chapters(5)
+        self._install()
+        for p in self.src.glob("mh-ch00[4-5].json"):
+            p.unlink()
+        self._install()
+        on_disk = sorted(p.name for p in (self.books / "audio" / "mh").glob("*.json"))
+        self.assertEqual(len(on_disk), 3)
+        self.assertEqual(len(self._entry()["audiobook"]["chapters"]), 3)
+
+    def test_preserves_a_hand_edited_title(self):
+        self._chapters(2)
+        self._install()
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        for e in data:
+            if e["filename"] == "novel/mh.fb2":
+                e["title"] = "Отредактировано вручную"
+        self.index.write_text(json.dumps(data, ensure_ascii=False),
+                              encoding="utf-8")
+        self._install()
+        self.assertEqual(self._entry()["title"], "Отредактировано вручную")
+
+    def test_backs_up_the_catalogue_before_first_write(self):
+        self._chapters(1)
+        self._install()
+        self.assertTrue((self.books / "index.json.bak").is_file())
+
+    def test_fails_clearly_when_no_chapters_exist(self):
+        proc = self._install()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("run the alignment script first",
+                      proc.stdout + proc.stderr)
+
+    def test_fails_clearly_when_repo_path_is_wrong(self):
+        self._chapters(1)
+        proc = self._install(repo_dir_wsl=str(self.root / "nope"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Not a Govorim checkout", proc.stderr)
 
 
 if __name__ == "__main__":

@@ -37,14 +37,16 @@ C:\Users\david\projects\Auto-MFA\dist\Auto-MFA\Auto-MFA.exe
 
 Check the **Pairs** box at the bottom — it shows exactly what will be aligned.
 
-### 4. Fill in the two Govorim fields
+### 4. Fill in the Govorim fields
 
-- **Book slug** — names every output file. `chekhov-dama` produces
-  `chekhov-dama-ch01.json`, `chekhov-dama-ch02.json`, …
-  Use the same slug pattern as the existing files in `public/books/audio/`.
+- **Book slug** — names the output files, the FB2, the audio folder and the
+  catalogue entry. `chekhov-dama` gives `public/books/audio/chekhov-dama/`.
 - **R2 folder** — the folder in the `govorim-audio` bucket where this book's
   audio lives (e.g. `dama`). This builds each file's `audio_url`. Leave it
   blank if the audio isn't uploaded yet; you can fill the URLs in later.
+- **Title / Author** — prefilled from the FB2's own metadata. These become the
+  book's catalogue entry, so check they read the way you want them to appear
+  in the picker.
 
 ### 5. Press GENERATE SCRIPT
 
@@ -110,23 +112,46 @@ the generated scripts, since those sit in book folders that get copied around.
 
 ---
 
-## Getting the JSONs into Govorim
+## Installing the book into Govorim
 
-Copy them into the repo, then commit:
+Press **Generate install script**, then run it:
+
+```bash
+# WSL
+bash '/mnt/c/Users/david/.../install_<slug>.sh'
+```
+
+That does all three things a book needs to actually work:
+
+1. copies the FB2 to `public/books/novel/<slug>.fb2`
+2. copies the chapter JSONs to `public/books/audio/<slug>/001.json`, `002.json`, …
+3. adds or updates the book's entry in `public/books/index.json`, including
+   the ordered `audiobook.chapters` list
+
+That third step is the one that's easy to miss by hand — the app does **not**
+scan the audio folder. A chapter that isn't listed in `index.json` doesn't
+exist as far as the reader is concerned.
+
+Re-running is safe: it replaces this book's files and entry, leaves every
+other book alone, preserves a title you've edited by hand in the repo, and
+backs up `index.json` the first time.
+
+Then commit:
 
 ```bash
 # Git Bash
 cd /c/Users/david/projects/govorim-app
-cp /c/Users/david/path/to/book/<slug>-ch*.json public/books/audio/
-git add public/books/audio/
-git commit -m "Add <book> alignment JSONs"
+git add public/books
+git commit -m "Add <book> audiobook alignment"
 git push
 ```
 
-Vercel picks up the push automatically; the deploy usually takes 1–2 minutes.
+Vercel redeploys on push (1–2 minutes). **Hard-refresh the site afterwards**
+(Ctrl+Shift+R) — the old chapter JSONs sit in the browser cache and will
+happily keep showing you the previous behaviour.
 
 If you left **R2 folder** blank when generating, the `audio_url` fields are
-bare filenames — fill them in before committing.
+bare filenames — fill those in before committing, or the audio won't load.
 
 ---
 
@@ -172,6 +197,21 @@ endnotes section, a different edition).
 **"No rclone remote named 'r2' is configured"**
 Run the `rclone config create` command in *Uploading the audio to R2* above.
 The script prints it too, with your endpoint already filled in.
+
+**Book installed but doesn't appear in the picker**
+Check `public/books/index.json` has an entry whose `filename` matches the FB2
+you installed. The install script writes one; if you moved or renamed the FB2
+afterwards, the entry no longer matches.
+
+**Book appears but has no audio / audio 404s**
+The `audio_url` fields point at R2. Either the audio wasn't uploaded (run the
+upload script), or **R2 folder** was blank when the JSONs were generated, so
+the URLs are bare filenames.
+
+**Book plays but highlighting is stuck or wrong**
+Hard-refresh first (Ctrl+Shift+R) — cached JSONs are the usual culprit. If it
+persists, the app reads the top-level `word_timings` array; check that it's
+present and non-empty in one of the installed chapter files.
 
 **Wrong chapters aligned**
 The FB2's chapter list is what the GUI shows. If it doesn't match the audio

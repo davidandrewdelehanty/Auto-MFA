@@ -26,13 +26,15 @@ import sys
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
-from .fb2 import extract_chapters, find_audio_files, find_fb2, transcript_words
-from .scriptgen import (build_script, build_upload_script, run_command_for,
-                        slugify, to_wsl_path)
+from .fb2 import (extract_chapters, extract_metadata, find_audio_files,
+                  find_fb2, transcript_words)
+from .scriptgen import (build_install_script, build_script,
+                        build_upload_script, run_command_for, slugify,
+                        to_wsl_path)
 
 WSL_INSTALL_URL = "https://learn.microsoft.com/en-us/windows/wsl/install"
 
@@ -57,7 +59,11 @@ class AutoMfaApp(tk.Tk):
         self.keep_temp = tk.BooleanVar(value=False)
         self.book_slug = tk.StringVar()
         self.r2_folder = tk.StringVar()
+        self.book_title = tk.StringVar()
+        self.book_author = tk.StringVar()
         self.project_dir = tk.StringVar(value=self._default_project_dir())
+        self.govorim_dir = tk.StringVar(value=self._default_govorim_dir())
+        self._fb2_path: "Path | None" = None
 
         self.chapters = []
         self.audio_files: list[Path] = []
@@ -80,6 +86,13 @@ class AutoMfaApp(tk.Tk):
         if not getattr(sys, "frozen", False):
             return to_wsl_path(Path(__file__).resolve().parent.parent)
         return to_wsl_path(Path.home() / "projects" / "Auto-MFA")
+
+    @classmethod
+    def _default_govorim_dir(cls) -> str:
+        """WSL-side path of the Govorim checkout, assumed to sit beside
+        this project (both under ...\\projects\\)."""
+        project = cls._default_project_dir()
+        return str(PurePosixPath(project).parent / "govorim-app")
 
     # ------------------------------------------------------------------ UI
     def _build_widgets(self) -> None:
@@ -152,12 +165,19 @@ class AutoMfaApp(tk.Tk):
         ttk.Label(gov, text="R2 folder:").grid(row=0, column=2, sticky="w")
         ttk.Entry(gov, textvariable=self.r2_folder).grid(
             row=0, column=3, sticky="ew", padx=4)
+        ttk.Label(gov, text="Title:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(gov, textvariable=self.book_title).grid(
+            row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        ttk.Label(gov, text="Author:").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        ttk.Entry(gov, textvariable=self.book_author).grid(
+            row=1, column=3, sticky="ew", padx=4, pady=(4, 0))
         ttk.Label(
             gov,
-            text=("Files are written as <slug>-ch01.json … ; R2 folder builds "
-                  "each audio_url and is where 'Upload script' sends the audio."),
+            text=("Files are written as <slug>-ch001.json … ; R2 folder builds "
+                  "each audio_url and is where the audio is uploaded. "
+                  "Title/Author fill the catalogue entry (read from the FB2)."),
             foreground="#555555",
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 0))
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
 
         # Alignment options
         opts = ttk.LabelFrame(root, text="Alignment options", padding=6)
@@ -184,12 +204,15 @@ class AutoMfaApp(tk.Tk):
         ttk.Label(opts, text="Auto-MFA folder (WSL path):").grid(row=3, column=0, sticky="w")
         ttk.Entry(opts, textvariable=self.project_dir).grid(
             row=3, column=1, columnspan=3, sticky="ew", padx=4)
+        ttk.Label(opts, text="Govorim repo (WSL path):").grid(row=4, column=0, sticky="w")
+        ttk.Entry(opts, textvariable=self.govorim_dir).grid(
+            row=4, column=1, columnspan=3, sticky="ew", padx=4)
         ttk.Checkbutton(opts, text="Auto-download missing models",
                         variable=self.auto_download).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(opts, text="Keep temporary files",
                         variable=self.keep_temp).grid(
-            row=4, column=2, columnspan=2, sticky="w", pady=(4, 0))
+            row=5, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
         # Buttons
         btns = ttk.Frame(root)
@@ -205,6 +228,9 @@ class AutoMfaApp(tk.Tk):
         self.btn_upload = ttk.Button(
             btns, text="Generate upload script", command=self._generate_upload)
         self.btn_upload.pack(side="left")
+        self.btn_install = ttk.Button(
+            btns, text="Generate install script", command=self._generate_install)
+        self.btn_install.pack(side="left", padx=(6, 0))
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=4)
         log_frame.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
@@ -262,9 +288,18 @@ class AutoMfaApp(tk.Tk):
             messagebox.showerror("Could not load folder", str(exc))
             return
         self.pairs = []
+        self._fb2_path = fb2_path
         self.output_folder.set(str(folder))
         if not self.book_slug.get().strip():
             self.book_slug.set(slugify(folder.name))
+        # Prefill the catalogue fields from the FB2's own metadata, so the
+        # book shows up in the app as "Дама с собачкой" rather than a
+        # slug-derived guess. Never overwrite something already typed.
+        meta = extract_metadata(fb2_path)
+        if meta["title"] and not self.book_title.get().strip():
+            self.book_title.set(meta["title"])
+        if meta["author"] and not self.book_author.get().strip():
+            self.book_author.set(meta["author"])
 
         self.audio_list.delete(0, "end")
         for a in self.audio_files:
@@ -565,6 +600,77 @@ class AutoMfaApp(tk.Tk):
             "(copied to your clipboard)\n\n"
             "It needs rclone with an 'r2' remote configured; the script "
             "prints the exact setup command if it isn't.")
+
+    def _generate_install(self) -> None:
+        """Write a script that installs the finished book into Govorim.
+
+        Deliberately generated rather than executed here: the repo lives
+        on the Linux side of the same workflow as the alignment, and this
+        keeps every step of the pipeline a reviewable script the user runs
+        themselves.
+        """
+        slug = self.book_slug.get().strip()
+        if not slug:
+            messagebox.showerror(
+                "Book slug required",
+                "Enter the book slug -- it names the FB2, the audio folder "
+                "and the catalogue entry in the app.")
+            return
+        repo = self.govorim_dir.get().strip()
+        if not repo:
+            messagebox.showerror(
+                "Govorim repo required",
+                "Enter the WSL path to your govorim-app checkout, e.g.\n"
+                "/mnt/c/Users/david/projects/govorim-app")
+            return
+        if self._fb2_path is None or not self._fb2_path.is_file():
+            messagebox.showerror(
+                "No FB2 loaded",
+                "Load the book folder first -- the FB2 is copied into the "
+                "app as the book's source text.")
+            return
+
+        dest = Path(self.output_folder.get() or self.book_folder.get())
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            script_path = dest / f"install_{slug}.sh"
+            script_path.write_text(
+                build_install_script(
+                    slug=slug,
+                    repo_dir_wsl=repo,
+                    fb2_src_wsl=to_wsl_path(self._fb2_path),
+                    json_src_dir_wsl=to_wsl_path(dest),
+                    title=self.book_title.get().strip(),
+                    author=self.book_author.get().strip(),
+                    version=__version__,
+                ),
+                encoding="utf-8", newline="\n")
+        except OSError as exc:
+            messagebox.showerror("Could not write install script", str(exc))
+            return
+
+        command = run_command_for(to_wsl_path(script_path))
+        self._run_command = command
+        self.btn_copy_cmd.configure(state="normal")
+        self.clipboard_clear()
+        self.clipboard_append(command)
+
+        self.log("---")
+        self.log(f"Wrote {script_path.name}")
+        self.log(f"Installs into {repo}: FB2 -> public/books/novel/{slug}.fb2, "
+                 f"chapters -> public/books/audio/{slug}/, and the "
+                 f"index.json catalogue entry.")
+        self.log("Run this in an Ubuntu (WSL) terminal:")
+        self.log(f"    {command}")
+        messagebox.showinfo(
+            "Install script ready",
+            f"Wrote:\n{script_path}\n\n"
+            f"It copies the FB2 and the aligned chapter JSONs into "
+            f"{slug}'s place in the app, and adds/updates its catalogue "
+            f"entry so the book actually appears.\n\n"
+            f"Run it in an Ubuntu (WSL) terminal:\n\n{command}\n\n"
+            "(copied to your clipboard)\n\n"
+            "Run the alignment first -- it needs the chapter JSONs.")
 
     def _copy_command(self) -> None:
         if not self._run_command:
