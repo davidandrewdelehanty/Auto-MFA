@@ -45,12 +45,23 @@ DEFAULT_R2_BASE = "https://pub-84adcd23e17e4925a0ac7eca17ea2556.r2.dev"
 
 DEFAULT_NARRATOR = "audiobook"
 
-# Sentence boundary: a terminator followed by whitespace. Deliberately the
-# same rule Govorim's own sentence-level build script uses, so fragments
-# here are chunked the way every already-shipped book was chunked. Includes
-# the Russian-typography characters that end a sentence in these texts:
-# ellipsis, closing guillemet, en/em dash.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…»–—])\s+")
+# Sentence boundary: a full stop, bang, question mark or ellipsis --
+# optionally inside a closing quote -- followed by whitespace. Matches what
+# Govorim's own parseSentences() breaks on, because the app pairs each
+# fragment against a sentence it parsed itself, and a fragment that isn't a
+# whole sentence there matches nothing.
+#
+# Notably NOT a boundary: the em and en dash. In Russian they open a line of
+# dialogue and separate clauses inside one -- "— Очень, — ответил сосед" is
+# a single sentence carrying two of them, and treating each as a terminator
+# chopped every line of dialogue in the book into three fragments. The
+# closing guillemet isn't one either: it ends a quotation, not a sentence
+# ("«Мастер и Маргарита»." ends at the full stop after it).
+# Two fixed-width lookbehinds rather than one pattern that also consumes the
+# closer: re.split drops what the separator matches, and a consumed "»" would
+# be cut off the end of the sentence it belongs to.
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?…])\s+|(?<=[.!?…][»\"”’)\]])\s+")
 
 # Below this share of the text carrying timings, the mapping is reported as
 # suspect. It is not an error: a chapter where the narrator reads a preface

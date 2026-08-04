@@ -32,6 +32,7 @@ from pathlib import Path, PurePosixPath
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import fb2, scriptgen  # noqa: E402
+from app.fb2 import transcript_words  # noqa: E402
 from app.govorim import DEFAULT_R2_BASE  # noqa: E402
 from app import __version__  # noqa: E402
 
@@ -39,7 +40,7 @@ from app import __version__  # noqa: E402
 def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
           title: str = "", author: str = "", narrator: str = "audiobook",
           num_jobs: int = 2, as_folder: str = "",
-          project: str = "") -> Path:
+          project: str = "", groups=None) -> Path:
     """Generate the run for the book in *folder*.
 
     *as_folder*, when given, is the path written INTO the generated scripts
@@ -55,13 +56,22 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     audio = fb2.find_audio_files(folder)
     src_dir = PurePosixPath(as_folder) if as_folder else folder
 
-    if len(audio) != len(chapters):
+    if groups:
+        if len(groups) != len(audio):
+            raise SystemExit(
+                f"{folder.name}: --groups lists {len(groups)} group(s) but "
+                f"there are {len(audio)} audio file(s).")
+        if sum(groups) != len(chapters):
+            raise SystemExit(
+                f"{folder.name}: --groups covers {sum(groups)} chapter(s) but "
+                f"the FB2 has {len(chapters)}.")
+    elif len(audio) != len(chapters):
         raise SystemExit(
             f"{folder.name}: {len(audio)} audio file(s) but {len(chapters)} "
             f"chapter(s).\n"
-            f"This tool only handles the one-file-per-chapter case, where the "
-            f"pairing needs no judgement. Pair this one in the GUI instead, "
-            f"or split/join the audio first."
+            f"Pass --groups to say how the chapters divide between the files "
+            f"(e.g. --groups 16,12,10,12 for a novel recorded one file per "
+            f"part), or pair this one in the GUI."
         )
 
     meta = fb2.extract_metadata(fb2_path)
@@ -79,12 +89,32 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     staged = [f"{i:0{width}d}{src.suffix.lower()}"
               for i, src in enumerate(audio, start=1)]
 
+    # One pair per audio file. With --groups a pair spans several chapters:
+    # the pipeline aligns the file whole and then cuts it back into one
+    # clip -- and one JSON -- per chapter, using each chapter's exact word
+    # count to find the boundaries. That is the shape the GUI produces for a
+    # multi-chapter pairing, built here from the group sizes instead of by
+    # hand. See Pair.sub_chapters in pipeline.py.
+    spans = []
+    at = 0
+    for size in (groups or [1] * len(chapters)):
+        spans.append(chapters[at:at + size])
+        at += size
+
+    pairs = []
+    for name, span in zip(staged, spans):
+        pair = {"audio": str(staged_dir / name),
+                "title": span[0]["title"] if len(span) == 1
+                         else f"{span[0]['title']} - {span[-1]['title']}",
+                "text": " ".join(c["text"] for c in span)}
+        if len(span) > 1:
+            pair["sub_chapters"] = [[c["title"], len(transcript_words(c["text"]))]
+                                    for c in span]
+            pair["sub_texts"] = [c["text"] for c in span]
+        pairs.append(pair)
+
     job = {
-        "pairs": [
-            {"audio": str(staged_dir / name), "title": ch["title"],
-             "text": ch["text"]}
-            for name, ch in zip(staged, chapters)
-        ],
+        "pairs": pairs,
         "output_dir": str(json_dir),
         "govorim_slug": slug,
         "r2_folder": r2_folder,
@@ -96,17 +126,20 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2),
                         encoding="utf-8")
 
-    # The upload script uploads exactly what's listed here, so the bucket
-    # never picks up the FB2, the scripts or the JSONs sitting nearby.
+    # What gets uploaded differs by mode. One file per chapter: the staged
+    # audio IS the chapter audio. Grouped: the staged files are whole parts,
+    # and what the app needs is the per-chapter clips the pipeline cuts out
+    # of them during alignment -- which don't exist until it has run, so the
+    # list is built at that point rather than now.
+    upload_src = staged_dir if not groups else (json_dir / "audio")
     list_path = out / "upload_list.txt"
-    list_path.write_text("\n".join(staged) + "\n", encoding="utf-8")
 
     project = project or str(Path(__file__).resolve().parent.parent)
     (out / f"align_{slug}.sh").write_text(
         scriptgen.build_script(slug, str(job_path), project, __version__),
         encoding="utf-8")
     (out / f"upload_{slug}.sh").write_text(
-        scriptgen.build_upload_script(r2_folder, str(staged_dir),
+        scriptgen.build_upload_script(r2_folder, str(upload_src),
                                       str(list_path), version=__version__),
         encoding="utf-8")
     (out / f"install_{slug}.sh").write_text(
@@ -117,10 +150,15 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
         encoding="utf-8")
 
     # Staging is a script step rather than something done here: it copies
-    # gigabytes, and it belongs in the same log as everything else.
-    copies = "\n".join(
-        f"cp -n {scriptgen.shell_quote(str(src_dir / src.name))} \"$STAGE\"/{name}"
-        for src, name in zip(audio, staged))
+    # gigabytes, and it belongs in the same log as everything else. The
+    # source/target pairs go in their own tab-separated file instead of one
+    # cp line per file -- War and Peace would otherwise put 361 copy
+    # commands in the middle of the script.
+    stage_list = out / "stage_list.txt"
+    stage_list.write_text(
+        "".join(f"{src_dir / src.name}\t{name}\n"
+                for src, name in zip(audio, staged)),
+        encoding="utf-8")
 
     run_path = out / f"run_{slug}.sh"
     run_path.write_text(f"""#!/usr/bin/env bash
@@ -152,15 +190,46 @@ mkdir -p "$STAGE"
 
 echo
 echo "--- 1/4  staging audio ------------------------------------------"
-{copies}
+# Tested by size rather than with `cp -n`: coreutils 9 warns on every
+# single -n invocation that its behaviour may change, which buries the
+# actual progress under one warning per file. Comparing sizes rather than
+# just testing existence matters because this step gets interrupted -- it
+# copies gigabytes and it is the first thing that runs -- and a half-copied
+# file left behind by a Ctrl-C would otherwise be skipped for good and
+# aligned as a truncated chapter.
+STAGE_LIST={scriptgen.shell_quote(str(stage_list))}
+total=$(grep -c . "$STAGE_LIST")
+n=0
+while IFS=$'\t' read -r src dst; do
+    n=$((n + 1))
+    want=$(stat -c %s "$src")
+    have=$(stat -c %s "$STAGE/$dst" 2>/dev/null || echo -1)
+    if [ "$have" = "$want" ]; then
+        printf '  [%d/%d] %s -- already staged\n' "$n" "$total" "$dst"
+        continue
+    fi
+    if [ "$have" != "-1" ]; then
+        printf '  [%d/%d] %s -- incomplete (%s of %s bytes), recopying ... ' \
+            "$n" "$total" "$dst" "$have" "$want"
+    else
+        printf '  [%d/%d] %s ... ' "$n" "$total" "$dst"
+    fi
+    cp "$src" "$STAGE/$dst"
+    printf 'done\n'
+done < "$STAGE_LIST"
 echo "staged $(ls -1 "$STAGE" | wc -l) file(s) in $STAGE"
 
 echo
 echo "--- 2/4  aligning (this is the long one) ------------------------"
+echo "MFA is quiet for the first minute or two while it loads the acoustic"
+echo "model and builds the corpus. That is normal -- it is not stuck."
 bash {scriptgen.shell_quote(str(out / f'align_{slug}.sh'))}
 
 echo
 echo "--- 3/4  uploading audio to R2 ----------------------------------"
+UPLOAD_SRC={scriptgen.shell_quote(str(upload_src))}
+ls -1 "$UPLOAD_SRC" > {scriptgen.shell_quote(str(list_path))}
+echo "uploading $(grep -c . {scriptgen.shell_quote(str(list_path))}) file(s) from $UPLOAD_SRC"
 bash {scriptgen.shell_quote(str(out / f'upload_{slug}.sh'))}
 
 echo
@@ -179,7 +248,11 @@ echo "=================================================================="
 
     print(f"Book:     {title}" + (f" -- {author}" if author else ""))
     print(f"FB2:      {fb2_path.name}")
-    print(f"Chapters: {len(chapters)}   Audio: {len(audio)}   (paired in order)")
+    if groups:
+        print(f"Chapters: {len(chapters)}   Audio: {len(audio)}   "
+              f"(grouped {','.join(str(g) for g in groups)})")
+    else:
+        print(f"Chapters: {len(chapters)}   Audio: {len(audio)}   (paired in order)")
     print(f"Written:  {out}")
     print()
     print("Run it with:")
@@ -205,10 +278,16 @@ def main() -> int:
     ap.add_argument("--project", default="",
                     help="path of the Auto-MFA checkout on the machine that "
                          "will RUN the scripts (defaults to this one)")
+    ap.add_argument("--groups", default="",
+                    help="comma-separated chapter counts, one per audio file, "
+                         "for a book recorded a part at a time "
+                         "(e.g. 16,12,10,12). Omit when each file is one "
+                         "chapter.")
     a = ap.parse_args()
     build(Path(a.folder), a.slug, a.r2_folder, a.repo, Path(a.work),
           title=a.title, author=a.author, narrator=a.narrator,
-          num_jobs=a.num_jobs, as_folder=a.as_folder, project=a.project)
+          num_jobs=a.num_jobs, as_folder=a.as_folder, project=a.project,
+          groups=[int(x) for x in a.groups.split(",") if x.strip()] or None)
     return 0
 
 

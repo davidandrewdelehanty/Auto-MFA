@@ -693,3 +693,31 @@ class PartialMatchTest(unittest.TestCase):
         text = " ".join(["слово%d" % i for i in range(20)])
         attach_timings(text, _aligned(["слово0", "слово1"]), log=logged.append)
         self.assertTrue(any("only" in m.lower() for m in logged), logged)
+
+
+class SentenceSplitTest(unittest.TestCase):
+    """Fragments have to be whole sentences by the app's definition: the
+    reader pairs each fragment against a sentence its own parser produced,
+    and a fragment that is half a sentence there matches nothing.
+    """
+
+    def test_dialogue_dashes_do_not_end_a_sentence(self):
+        """The em dash opens a line of Russian dialogue and separates
+        clauses inside it -- one sentence can carry three."""
+        line = "— Очень, — ответил сосед с готовностью, — и заметьте, это."
+        self.assertEqual(govorim.split_sentences(line), [line])
+
+    def test_closing_guillemet_ends_a_quotation_not_a_sentence(self):
+        self.assertEqual(
+            govorim.split_sentences("Он сказал: «Мастер и Маргарита». Потом ушёл."),
+            ["Он сказал: «Мастер и Маргарита».", "Потом ушёл."])
+
+    def test_terminator_inside_a_quotation_still_splits(self):
+        """...and the closing quote stays on the sentence it belongs to."""
+        self.assertEqual(govorim.split_sentences("«Привет!» Он обернулся."),
+                         ["«Привет!»", "Он обернулся."])
+
+    def test_all_four_terminators(self):
+        self.assertEqual(
+            govorim.split_sentences("Раз. Два! Три? Четыре…  Пять."),
+            ["Раз.", "Два!", "Три?", "Четыре…", "Пять."])
