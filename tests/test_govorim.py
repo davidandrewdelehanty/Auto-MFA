@@ -531,6 +531,42 @@ class InstallScriptTest(unittest.TestCase):
         data = json.loads(self.index.read_text(encoding="utf-8"))
         return next(e for e in data if e["filename"] == "novel/mh.fb2")
 
+    def test_reinstall_under_a_new_fb2_name_replaces_the_old_entry(self):
+        """Re-aligning a book that was first installed by hand renames its
+        FB2 to <slug>.fb2. Matching the catalogue on filename alone would
+        append a second entry -- and the first one still points at the
+        chapter files this run just renamed, so the picker would show the
+        book twice, once broken. Identity is the audio folder.
+        """
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        data.append({
+            "filename": "novel/Чехов - Дама с собачкой.fb2",
+            "title": "Дама с собачкой", "author": "Антон Чехов",
+            "category": "Works", "description": "curated by hand",
+            "audiobook": {"narrator": "audiobook", "source": "x",
+                          "chapters": ["audio/mh/ch00.json", "audio/mh/ch01.json"]},
+        })
+        self.index.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        self._chapters(3)
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        entries = json.loads(self.index.read_text(encoding="utf-8"))
+        mine = [e for e in entries
+                if (e.get("audiobook") or {}).get("chapters", [{}])
+                and str((e["audiobook"]["chapters"] or [""])[0]).startswith("audio/mh/")]
+        self.assertEqual(len(mine), 1, f"book listed twice: {entries}")
+        self.assertEqual(mine[0]["filename"], "novel/mh.fb2")
+        # Hand-curated fields carry across rather than being lost.
+        self.assertEqual(mine[0]["description"], "curated by hand")
+        # And the chapter list is the one just installed, not the stale one.
+        self.assertEqual(mine[0]["audiobook"]["chapters"],
+                         ["audio/mh/001.json", "audio/mh/002.json",
+                          "audio/mh/003.json"])
+        # The unrelated book is untouched.
+        self.assertTrue(any(e["filename"] == "novel/other.fb2" for e in entries))
+
     def test_installs_fb2_chapters_and_catalogue_entry(self):
         self._chapters(3)
         proc = self._install()

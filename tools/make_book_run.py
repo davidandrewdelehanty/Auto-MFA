@@ -79,6 +79,7 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
     author = author or meta.get("author") or ""
 
     out = Path(work) / slug
+    tmp_dir = Path(work) / "_tmp"
     staged_dir = out / "audio"
     json_dir = out / "json"
     out.mkdir(parents=True, exist_ok=True)
@@ -188,6 +189,15 @@ echo "=================================================================="
 STAGE={scriptgen.shell_quote(str(staged_dir))}
 mkdir -p "$STAGE"
 
+# Working space for the alignment. Every hour of audio becomes roughly
+# 230 MB of temporary WAV -- a full-length decode plus the per-utterance
+# cuts, both alive at once -- so a long book needs several GB. The default
+# would be /tmp, which under WSL is the Linux VM's own disk rather than the
+# drive the audio came from; Идиот's 27 hours filled it mid-run.
+export TMPDIR="${{AUTO_MFA_TMPDIR:-{tmp_dir}}}"
+mkdir -p "$TMPDIR"
+echo "working space: $TMPDIR ($(df -h "$TMPDIR" | awk 'NR==2 {{print $4}}') free)"
+
 echo
 echo "--- 1/4  staging audio ------------------------------------------"
 # Tested by size rather than with `cp -n`: coreutils 9 warns on every
@@ -240,9 +250,11 @@ echo
 echo "=================================================================="
 echo "'{slug}' done at $(date '+%Y-%m-%d %H:%M:%S')"
 echo
-echo "Then, to publish:"
-echo "    cd {repo}"
-echo "    git add public/books && git commit -m 'Re-align {slug}' && git push"
+echo "Changed in {repo}:"
+echo "    public/books/novel/{slug}.fb2"
+echo "    public/books/audio/{slug}/"
+echo "    public/books/index.json"
+echo "Review and publish those, then hard-refresh the site (Ctrl+Shift+R)."
 echo "=================================================================="
 """, encoding="utf-8")
 

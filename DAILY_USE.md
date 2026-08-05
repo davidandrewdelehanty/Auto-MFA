@@ -136,19 +136,17 @@ Re-running is safe: it replaces this book's files and entry, leaves every
 other book alone, preserves a title you've edited by hand in the repo, and
 backs up `index.json` the first time.
 
-Then commit:
+The script touches three things in the repo, and prints them when it
+finishes:
 
-```bash
-# Git Bash
-cd /c/Users/david/projects/govorim-app
-git add public/books
-git commit -m "Add <book> audiobook alignment"
-git push
-```
+- `public/books/novel/<slug>.fb2`
+- `public/books/audio/<slug>/`
+- `public/books/index.json`
 
-Vercel redeploys on push (1–2 minutes). **Hard-refresh the site afterwards**
-(Ctrl+Shift+R) — the old chapter JSONs sit in the browser cache and will
-happily keep showing you the previous behaviour.
+Review and publish those however you normally do. Vercel redeploys on push
+(1–2 minutes). **Hard-refresh the site afterwards** (Ctrl+Shift+R) — the old
+chapter JSONs sit in the browser cache and will happily keep showing you the
+previous behaviour.
 
 If you left **R2 folder** blank when generating, the `audio_url` fields are
 bare filenames — fill those in before committing, or the audio won't load.

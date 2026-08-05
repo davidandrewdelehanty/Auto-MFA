@@ -3,6 +3,8 @@ convert the resulting TextGrids to JSON (recombining chunked files), and zip
 the JSONs.
 """
 
+import bisect
+import difflib
 import json
 import os
 import shutil
@@ -222,6 +224,56 @@ def invoke_mfa(args: List[str], log: LogFn) -> int:
     return 0
 
 
+# 16 kHz, 16-bit, mono -- what MFA is fed, and what every intermediate WAV
+# in the work directory is written as.
+_WAV_BYTES_PER_SECOND = 16000 * 2 * 1
+
+
+def _check_disk_space(pairs: List[Pair], work_dir: Path, ffmpeg: str,
+                      log: LogFn) -> None:
+    """Fail before a long run rather than hours into it.
+
+    Every source file is decoded to a full-length WAV *and* cut into
+    per-utterance WAVs, so the work directory transiently holds two complete
+    copies of the audio -- and the whole-file copies have to stay, because
+    the per-chapter clips are cut from them at the end. At 32 kB/s that is
+    about 115 MB per hour of audio for each of them -- 230 MB an hour all
+    in, so Идиот's four parts (26.9 hours) need a little over 6.5 GB. The
+    default work directory lives under TMPDIR, which on WSL is the Linux
+    VM's own disk rather than the drive the audio came from, and running it
+    out of space produced nothing but ffmpeg's exit code, from a cut partway
+    through the third file.
+    """
+    total_seconds = 0.0
+    for pair in pairs:
+        try:
+            total_seconds += max(0.0, audio_mod.probe_duration(str(pair.audio)))
+        except Exception:  # noqa: BLE001
+            pass            # unreadable file: prepare_corpus reports it properly
+    if total_seconds <= 0:
+        return
+    needed = int(total_seconds * _WAV_BYTES_PER_SECOND * 2 * 1.15)
+    try:
+        free = shutil.disk_usage(work_dir).free
+    except OSError:
+        return              # can't tell; let the run proceed
+    gb = 1024 ** 3
+    log(f"  {total_seconds / 3600:.1f}h of audio; needs about "
+        f"{needed / gb:.1f} GB of working space, {free / gb:.1f} GB free.")
+    if free >= needed:
+        return
+    raise RuntimeError(
+        f"Not enough working space: this run needs about {needed / gb:.1f} GB "
+        f"but only {free / gb:.1f} GB is free on {work_dir}.\n\n"
+        f"Every hour of audio becomes roughly 230 MB of temporary WAV (a "
+        f"full-length copy plus the per-utterance cuts), and all of it has to "
+        f"exist at once.\n\n"
+        f"Point the work directory somewhere with room and re-run:\n"
+        f"    export TMPDIR=/mnt/c/Users/david/Downloads/audiobooks/_tmp\n"
+        f"    mkdir -p \"$TMPDIR\""
+    )
+
+
 def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
                    progress: ProgressFn, ffmpeg: Optional[str] = None,
                    target_seconds: float = segment_mod.DEFAULT_TARGET,
@@ -243,6 +295,8 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
     corpus_dir = _corpus_dir(work_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    _check_disk_space(pairs, work_dir, ffmpeg, log)
 
     jobs: List[CorpusJob] = []
     total = len(pairs)
@@ -417,6 +471,68 @@ def _shift(tiers: Dict[str, List[Dict]], offset: float) -> Dict[str, List[Dict]]
     return out
 
 
+def _boundaries_by_anchors(sub_texts: List[str], words: List[Dict],
+                           n_chapters: int) -> Optional[List[int]]:
+    """Where each chapter starts in the aligned word stream, found by
+    matching rather than counting.
+
+    Counting only works when every word aligned. It usually doesn't: MFA
+    emits nothing for an utterance it can't align, so a pair covering
+    sixteen chapters can arrive 6,560 words short. The old fallback split
+    the stream proportionally, which spreads that shortfall across every
+    boundary -- and a boundary off by a few hundred words hands the end of
+    one chapter to the start of the next, so BOTH lose their timings.
+    Measured on Идиот, that turned an 11% word shortfall into a 21% coverage
+    loss, and a 1.9% shortfall into 9%.
+
+    Matching each chapter's own words against what MFA actually produced
+    keeps the error local: a missing stretch costs only its own timings, and
+    the chapters either side still start where they really start.
+
+    Returns one index per chapter plus a final end index, or None if the
+    per-chapter text isn't available to match against.
+    """
+    if len(sub_texts) != n_chapters or not words:
+        return None
+
+    expected: List[str] = []
+    starts = [0]
+    for text in sub_texts:
+        expected.extend(transcript_words(text))
+        starts.append(len(expected))
+    if not expected:
+        return None
+
+    actual = [str(w.get("text", "")) for w in words]
+    matcher = difflib.SequenceMatcher(None, expected, actual, autojunk=False)
+    # expected index -> aligned index, for the words that do correspond
+    mapped: Dict[int, int] = {}
+    for i, j, size in matcher.get_matching_blocks():
+        for k in range(size):
+            mapped[i + k] = j + k
+    if not mapped:
+        return None
+    keys = sorted(mapped)
+
+    bounds = [0]
+    for start in starts[1:-1]:
+        # The first matched word at or after this chapter's first word; if
+        # the chapter opens with a stretch that never aligned, fall back to
+        # just after the last matched word before it.
+        pos = bisect.bisect_left(keys, start)
+        if pos < len(keys):
+            bounds.append(mapped[keys[pos]])
+        elif keys:
+            bounds.append(mapped[keys[-1]] + 1)
+        else:
+            bounds.append(bounds[-1])
+    bounds.append(len(actual))
+    for i in range(1, len(bounds)):
+        if bounds[i] < bounds[i - 1]:
+            bounds[i] = bounds[i - 1]
+    return bounds
+
+
 def _split_pair_into_chapters(pair: Pair, pair_idx: int, words: List[Dict],
                               phones: List[Dict], duration: float,
                               work_dir: Optional[Path], ffmpeg: Optional[str],
@@ -444,13 +560,23 @@ def _split_pair_into_chapters(pair: Pair, pair_idx: int, words: List[Dict],
             cum += wc
             bounds.append(cum)
     else:
-        log(f"  Warning: expected {expected_total} words across {n} chapters "
-            f"but alignment produced {len(words)} for '{pair.audio.name}'; "
-            f"falling back to a proportional split (chapter boundaries may "
-            f"be slightly off).")
-        for _, wc in sub_chapters[:-1]:
-            cum += wc
-            bounds.append(round(cum / expected_total * len(words)) if expected_total else 0)
+        anchored = _boundaries_by_anchors(pair.sub_texts or [], words,
+                                          len(sub_chapters))
+        if anchored is not None:
+            log(f"  Note: expected {expected_total} words across {n} chapters "
+                f"but alignment produced {len(words)} for '{pair.audio.name}'; "
+                f"located the chapter boundaries by matching each chapter's "
+                f"own words against the alignment.")
+            bounds = anchored[:-1]
+        else:
+            log(f"  Warning: expected {expected_total} words across {n} "
+                f"chapters but alignment produced {len(words)} for "
+                f"'{pair.audio.name}', and the per-chapter text needed to "
+                f"locate the boundaries is not available; falling back to a "
+                f"proportional split (chapter boundaries may be off).")
+            for _, wc in sub_chapters[:-1]:
+                cum += wc
+                bounds.append(round(cum / expected_total * len(words)) if expected_total else 0)
     bounds.append(len(words))
     for i in range(1, len(bounds)):
         if bounds[i] < bounds[i - 1]:

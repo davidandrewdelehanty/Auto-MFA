@@ -153,18 +153,33 @@ def plan_segments(duration: float, silences: List[Tuple[float, float]],
     return [Segment(a, b) for a, b in zip(boundaries, boundaries[1:]) if b > a]
 
 
+def _run_ffmpeg(cmd: List[str], what: str) -> None:
+    """Run ffmpeg, and on failure report what IT said.
+
+    subprocess's own CalledProcessError says only "returned non-zero exit
+    status N", which for ffmpeg is close to useless -- the actual reason is
+    always on stderr, and the reason that matters most here ("No space left
+    on device", after a long run has filled the temp directory with hours of
+    16 kHz WAV) is unrecoverable-looking until you can read it.
+    """
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else f"exit status {proc.returncode}"
+        raise RuntimeError(f"ffmpeg failed while {what}: {reason}")
+
+
 def cut_segment(ffmpeg: str, src_wav: str, dst_wav: str, start: float, dur: float) -> None:
     """Extract [start, start+dur) from *src_wav* into *dst_wav* (16-bit PCM)."""
-    cmd = [
+    _run_ffmpeg([
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start:.6f}", "-i", src_wav, "-t", f"{dur:.6f}",
         "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
         dst_wav,
-    ]
-    subprocess.run(
-        cmd, check=True, capture_output=True, text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    ], f"cutting {dur:.1f}s at {start:.1f}s from {Path(src_wav).name}")
 
 
 def cut_segment_mp3(ffmpeg: str, src_wav: str, dst_mp3: str, start: float, dur: float,
@@ -176,13 +191,9 @@ def cut_segment_mp3(ffmpeg: str, src_wav: str, dst_mp3: str, start: float, dur: 
     physically cut back into one clip per chapter): a compact, shippable file
     matters more there than raw PCM.
     """
-    cmd = [
+    _run_ffmpeg([
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start:.6f}", "-i", src_wav, "-t", f"{dur:.6f}",
         "-c:a", "libmp3lame", "-b:a", bitrate,
         dst_mp3,
-    ]
-    subprocess.run(
-        cmd, check=True, capture_output=True, text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    ], f"encoding {Path(dst_mp3).name}")

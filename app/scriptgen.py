@@ -273,7 +273,37 @@ if index_path.exists():
     entries = json.loads(index_path.read_text(encoding="utf-8"))
 
 filename = f"novel/{{fb2_dest.name}}"
+
+# A book already in the catalogue under a DIFFERENT filename is the same
+# book, not a second one. This happens on every re-alignment of a book that
+# was first installed by hand: the FB2 was called
+# "Kostyuchenko_Moya-lyubimaya-strana_RuLit_Me.fb2" then and is called
+# "moya-strana.fb2" now, so matching on filename alone appends a duplicate
+# -- and the stale entry still points at the chapter files this run just
+# renamed, so the picker ends up showing the book twice, once broken.
+# Identity is the audio folder: two entries whose chapters live in
+# audio/<slug>/ are the same book whatever their FB2 is called.
+def owns_this_audio(e):
+    for c in ((e.get("audiobook") or {{}}).get("chapters") or []):
+        if isinstance(c, str) and c.startswith(f"audio/{{slug}}/"):
+            return True
+    return False
+
+superseded = [e for e in entries
+              if e.get("filename") != filename and owns_this_audio(e)]
 entry = next((e for e in entries if e.get("filename") == filename), None)
+for old_entry in superseded:
+    # Carry across anything curated by hand before dropping it.
+    if entry is None:
+        old_entry["filename"] = filename      # reuse it, keeping title/author
+        entry = old_entry
+    else:
+        for k, v in old_entry.items():
+            entry.setdefault(k, v)
+        entries.remove(old_entry)
+    print(f"index.json -> replaced the earlier entry for this book "
+          f"({{old_entry.get('filename')}})")
+
 created = entry is None
 if entry is None:
     entry = {{"filename": filename}}
@@ -302,14 +332,13 @@ print(f"index.json -> {{'added' if created else 'updated'}} '{{entry['title']}}'
 PY
 
 echo
-echo "Done. Check it renders, then commit:"
-echo "    cd \\"$REPO\\""
-echo "    git add public/books"
-echo "    git commit -m \\"Add $SLUG audiobook alignment\\""
-echo "    git push"
+echo "Done. Changed in the repo, ready to review and publish:"
+echo "    public/books/novel/$SLUG.fb2"
+echo "    public/books/audio/$SLUG/"
+echo "    public/books/index.json"
 echo
-echo "Vercel redeploys on push (1-2 min). Hard-refresh the site afterwards"
-echo "(Ctrl+Shift+R) -- the old chapter JSONs sit in the browser cache."
+echo "Vercel redeploys once it is pushed (1-2 min). Hard-refresh the site"
+echo "afterwards (Ctrl+Shift+R) -- the old chapter JSONs sit in the cache."
 """
 
 

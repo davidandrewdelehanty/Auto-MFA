@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import collections
 import tempfile
 import unittest
 import zipfile
@@ -594,3 +595,100 @@ class UnalignedSegmentsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiskSpaceCheckTest(unittest.TestCase):
+    """A long run must fail at the start, not hours in. Filling the temp
+    directory mid-corpus surfaced only ffmpeg's exit code, from a cut
+    somewhere in the middle of the third file.
+    """
+
+    def _pairs(self, hours):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        (root / "a.mp3").write_bytes(b"x")
+        return [Pair(root / "a.mp3", "T", "текст")], root
+
+    def _run_check(self, hours, free_gb):
+        from app.pipeline import _check_disk_space
+        pairs, root = self._pairs(hours)
+        usage = collections.namedtuple("usage", "total used free")
+        with mock.patch("app.pipeline.audio_mod.probe_duration",
+                        return_value=hours * 3600), \
+             mock.patch("app.pipeline.shutil.disk_usage",
+                        return_value=usage(0, 0, int(free_gb * 1024 ** 3))):
+            logged = []
+            _check_disk_space(pairs, root, "ffmpeg", logged.append)
+            return logged
+
+    def test_passes_when_there_is_room(self):
+        logged = self._run_check(hours=27, free_gb=50)
+        self.assertTrue(any("27.0h of audio" in m for m in logged), logged)
+
+    def test_refuses_when_short_and_says_how_to_fix_it(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run_check(hours=27, free_gb=2)
+        msg = str(ctx.exception)
+        self.assertIn("TMPDIR", msg)
+        self.assertIn("2.0 GB is free", msg)
+
+    def test_a_short_book_is_not_blocked(self):
+        self._run_check(hours=0.5, free_gb=1)   # must not raise
+
+
+class ChapterBoundaryTest(unittest.TestCase):
+    """One audio file spanning several chapters is cut back apart on word
+    positions. Counting words only works if every word aligned; when MFA
+    drops an utterance the count is short, and splitting proportionally
+    smears that shortfall across every boundary so neighbouring chapters
+    lose timings too.
+    """
+
+    def _split(self, chapter_texts, drop=()):
+        from app.pipeline import _split_pair_into_chapters
+        from app.fb2 import transcript_words
+        expected = []
+        for t in chapter_texts:
+            expected.extend(transcript_words(t))
+        # MFA's output: the same words, minus a dropped stretch, one per second.
+        words = [{"text": w, "start": float(i), "end": i + 0.5}
+                 for i, w in enumerate(expected)
+                 if not any(lo <= i < hi for lo, hi in drop)]
+        pair = Pair(Path("/x/whole.mp3"), "T", " ".join(chapter_texts),
+                    sub_chapters=[[t, len(transcript_words(t))] for t in chapter_texts],
+                    sub_texts=list(chapter_texts))
+        return _split_pair_into_chapters(
+            pair, 0, words, [], float(len(expected)), None, None,
+            log=lambda m: None)
+
+    def test_exact_counts_split_on_word_boundaries(self):
+        texts = [" ".join(f"альфа{i}" for i in range(40)),
+                 " ".join(f"бета{i}" for i in range(40))]
+        out = self._split(texts)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(w["text"].startswith("альфа") for w in out[0]["words"]))
+        self.assertTrue(all(w["text"].startswith("бета") for w in out[1]["words"]))
+
+    def test_a_dropped_stretch_does_not_leak_across_the_boundary(self):
+        """The regression this exists for: with 20 words missing from the
+        middle of chapter 1, a proportional split moved the boundary and
+        handed chapter 1's tail to chapter 2."""
+        texts = [" ".join(f"альфа{i}" for i in range(60)),
+                 " ".join(f"бета{i}" for i in range(60))]
+        out = self._split(texts, drop=[(20, 40)])
+        self.assertEqual(len(out), 2)
+        stray = [w["text"] for w in out[0]["words"] if not w["text"].startswith("альфа")]
+        self.assertEqual(stray, [], "chapter 2's words leaked into chapter 1")
+        stray2 = [w["text"] for w in out[1]["words"] if not w["text"].startswith("бета")]
+        self.assertEqual(stray2, [], "chapter 1's words leaked into chapter 2")
+        # And chapter 2 keeps ALL of its words despite chapter 1's hole.
+        self.assertEqual(len(out[1]["words"]), 60)
+
+    def test_a_hole_spanning_the_boundary_is_survivable(self):
+        texts = [" ".join(f"альфа{i}" for i in range(50)),
+                 " ".join(f"бета{i}" for i in range(50))]
+        out = self._split(texts, drop=[(45, 55)])
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(w["text"].startswith("альфа") for w in out[0]["words"]))
+        self.assertTrue(all(w["text"].startswith("бета") for w in out[1]["words"]))
