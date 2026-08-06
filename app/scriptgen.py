@@ -124,6 +124,7 @@ def build_install_script(slug: str, repo_dir_wsl: str, fb2_src_wsl: str,
                          source_note: str = "owned recording",
                          r2_folder: str = "",
                          r2_base: str = "",
+                         replaces: str = "",
                          version: str = "") -> str:
     """Script that installs a finished book into the Govorim app.
 
@@ -168,8 +169,9 @@ NARRATOR={shell_quote(narrator)}
 SOURCE_NOTE={shell_quote(source_note)}
 R2_FOLDER={shell_quote(r2_folder)}
 R2_BASE={shell_quote(r2_base)}
+REPLACES={shell_quote(replaces)}
 export REPO FB2 JSON_SRC SLUG TITLE AUTHOR CATEGORY NARRATOR SOURCE_NOTE
-export R2_FOLDER R2_BASE
+export R2_FOLDER R2_BASE REPLACES
 
 if [ ! -d "$REPO/public/books" ]; then
     echo "Not a Govorim checkout: $REPO" >&2
@@ -283,9 +285,16 @@ filename = f"novel/{{fb2_dest.name}}"
 # renamed, so the picker ends up showing the book twice, once broken.
 # Identity is the audio folder: two entries whose chapters live in
 # audio/<slug>/ are the same book whatever their FB2 is called.
+# REPLACES names the audio folder(s) an earlier install of this same book
+# used, for when the slug has changed too ("mp-good" -> "moskva-petushki").
+# Without it the old entry is invisible to the check below and the book ends
+# up listed twice.
+owned = {{f"audio/{{slug}}/"}}
+owned |= {{f"audio/{{s.strip()}}/" for s in os.environ.get("REPLACES", "").split(",") if s.strip()}}
+
 def owns_this_audio(e):
     for c in ((e.get("audiobook") or {{}}).get("chapters") or []):
-        if isinstance(c, str) and c.startswith(f"audio/{{slug}}/"):
+        if isinstance(c, str) and any(c.startswith(o) for o in owned):
             return True
     return False
 
@@ -293,6 +302,11 @@ superseded = [e for e in entries
               if e.get("filename") != filename and owns_this_audio(e)]
 entry = next((e for e in entries if e.get("filename") == filename), None)
 for old_entry in superseded:
+    # Captured before the reuse branch below renames it.
+    stale_fb2 = old_entry.get("filename")
+    stale_audio = sorted({{c.rsplit("/", 1)[0]
+                          for c in ((old_entry.get("audiobook") or {{}}).get("chapters") or [])
+                          if isinstance(c, str) and "/" in c}})
     # Carry across anything curated by hand before dropping it.
     if entry is None:
         old_entry["filename"] = filename      # reuse it, keeping title/author
@@ -302,7 +316,18 @@ for old_entry in superseded:
             entry.setdefault(k, v)
         entries.remove(old_entry)
     print(f"index.json -> replaced the earlier entry for this book "
-          f"({{old_entry.get('filename')}})")
+          f"({{stale_fb2}})")
+    # The entry is gone but its files are not, and the manifest generator
+    # re-adds an entry for any FB2 left in novel/ -- so leaving the old one
+    # there puts the book back in the picker a second time on the next build.
+    leftovers = ([f"public/books/{{stale_fb2}}"] if stale_fb2 != filename else []) + [
+        f"public/books/{{d}}/" for d in stale_audio
+        if d != f"audio/{{slug}}"]
+    if leftovers:
+        print("NOTE: the earlier version's files are still in the repo and "
+              "should be removed, or the book comes back twice:")
+        for item in leftovers:
+            print(f"        {{item}}")
 
 created = entry is None
 if entry is None:

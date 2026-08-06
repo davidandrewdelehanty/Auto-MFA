@@ -8,6 +8,7 @@ import difflib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -82,6 +83,45 @@ class Pair:
     # the normalized transcript. Optional -- everything else in the pipeline
     # works fine without it.
     sub_texts: Optional[List[str]] = None
+    # Stretches of audio, as (start, end) seconds, that no transcript
+    # accounts for: applause, a musical sting, an announcer. MFA cannot
+    # decline to align -- given an utterance whose audio is applause and
+    # whose text is the next sentence, it puts the words there anyway.
+    # Брежнев's 1977 speech opens with 26 seconds of ovation and is
+    # interrupted by more at 2:04, and both times the surrounding words were
+    # crushed into a fraction of a second. These spans are cut out of the
+    # alignment; the audio itself is untouched, so the applause is still
+    # there for the listener and every timing still refers to a real
+    # position in the file.
+    skip_ranges: Optional[List[Tuple[float, float]]] = None
+    # Align the whole pair as ONE utterance, built by cutting out the
+    # skip_ranges and joining what's left. Removes the proportional text
+    # split entirely -- MFA places every word itself against exactly the
+    # audio it was spoken in -- at the cost of one very long utterance, so
+    # this is for SHORT recordings only. See _single_utterance_job.
+    single_utterance: bool = False
+    # Stretches of the TEXT, as half-open [start, end) index ranges into
+    # transcript_words(text), that the recording does not contain: an
+    # abridgement, a passage the reader skipped, a footnote printed in this
+    # edition and in no other.
+    #
+    # This is the mirror image of skip_ranges, and it exists for the same
+    # reason. MFA is a forced aligner: it cannot report that a word is
+    # absent, only decide where in the audio to put it. The 1977 October
+    # speech ends with 146 words of peroration in the book over 40 seconds
+    # of tape -- about 67 words at the pace he keeps elsewhere -- so MFA
+    # fitted all 146 in at three words a second and the highlighting ran
+    # away from the voice for the last minute and a half. No amount of
+    # skipping applause could fix that: the surplus was never in the audio.
+    #
+    # Dropping those words from the transcript costs nothing visible: the
+    # chapter still displays every word the author wrote, because Govorim
+    # renders pair.text and govorim._attach_indexed matches the aligned
+    # words back onto it with difflib. A word with no alignment behind it
+    # carries no timing, so it stays unhighlighted and the highlighting
+    # resumes on the far side of the hole. tools/asr_check.py finds these
+    # ranges by transcribing the audio and diffing it against the text.
+    drop_words: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
@@ -90,7 +130,17 @@ class CorpusJob:
     chunk_index: int
     wav: str
     txt: str
-    duration: float  # ground truth: exactly what we told ffmpeg to cut, in
+    # Absolute position of this segment in the pair's audio. Set whenever
+    # the segments are not contiguous -- skipping applause leaves holes, and
+    # accumulating durations would slide everything after one earlier. None
+    # keeps the old contiguous accumulation.
+    start: Optional[float] = None
+    # When this job's audio was assembled from several spans of the
+    # original (see _single_utterance_job), the spans in original time, in
+    # order. Timings come back on the assembled clock and have to be mapped
+    # home. None for an ordinary contiguous segment.
+    spans: Optional[List[Tuple[float, float]]] = None
+    duration: float = 0.0  # ground truth: exactly what we told ffmpeg to cut, in
                       # seconds. Used to place this job's alignment at the
                       # right offset in postprocess() -- see the comment there
                       # for why this must NOT be inferred from MFA's own
@@ -274,6 +324,117 @@ def _check_disk_space(pairs: List[Pair], work_dir: Path, ffmpeg: str,
     )
 
 
+def _map_to_original(t: float, spans: List[Tuple[float, float]]) -> float:
+    """A time on the assembled (applause-removed) clock, back in the file."""
+    at = 0.0
+    for lo, hi in spans:
+        length = hi - lo
+        if t <= at + length:
+            return lo + (t - at)
+        at += length
+    return spans[-1][1] if spans else t
+
+
+def _map_tiers(tiers: Dict[str, List[Dict]],
+               spans: List[Tuple[float, float]]) -> Dict[str, List[Dict]]:
+    return {name: [{**it,
+                    "start": round(_map_to_original(it["start"], spans), 6),
+                    "end": round(_map_to_original(it["end"], spans), 6)}
+                   for it in intervals]
+            for name, intervals in tiers.items()}
+
+
+def _single_utterance_job(pair: Pair, idx: int, raw_wav: Path, duration: float,
+                          corpus_dir: Path, work_dir: Path, ffmpeg: str,
+                          words: List[str], log: LogFn) -> CorpusJob:
+    """Build one utterance holding all of the pair's SPEECH, applause cut out.
+
+    The ordinary path divides the transcript between utterances in
+    proportion to their duration, which silently assumes a constant
+    speaking rate. Брежнев opens ceremonially at 0.82 words a second and
+    averages 1.34, so his first span was handed 71 words where he says 44 --
+    and MFA, which cannot decline, pulled the other 27 forward and every
+    word after them slid early.
+
+    Joining the speech into one utterance removes the guess completely:
+    there is only one segment, so there is nothing to divide. The price is
+    a very long utterance, which costs memory and needs a wide beam, so
+    this suits speeches and not novels.
+    """
+    spans = _speech_spans(pair.skip_ranges, duration)
+    parts_dir = Path(work_dir) / "spans"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    listing = parts_dir / f"{idx:03d}.txt"
+    lines = []
+    for k, (lo, hi) in enumerate(spans):
+        part = parts_dir / f"{idx:03d}_{k:03d}.wav"
+        segment_mod.cut_segment(ffmpeg, str(raw_wav), str(part), lo, hi - lo)
+        lines.append("file '%s'" % str(part).replace("'", "'\\''"))
+    listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    stem = _pair_stem(idx, pair)
+    seg_wav = Path(corpus_dir) / f"{stem}_000.wav"
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(listing),
+                    "-c", "copy", str(seg_wav)], check=True,
+                   capture_output=True, text=True)
+    txt = Path(corpus_dir) / f"{stem}_000.txt"
+    txt.write_text(words_to_text(words), encoding="utf-8")
+    kept = sum(hi - lo for lo, hi in spans)
+    log(f"  One utterance of {kept:.0f}s ({duration - kept:.0f}s of "
+        f"non-speech removed), {len(words)} words, no proportional split.")
+    return CorpusJob(idx, 0, str(seg_wav), str(txt), start=0.0, spans=spans,
+                     duration=kept)
+
+
+def _speech_spans(skip_ranges, duration: float):
+    """[(start, end), ...] of the audio that HAS a transcript.
+
+    The complement of *skip_ranges* within [0, duration], merged and
+    clamped. Always returns at least one span so a book with nothing to
+    skip behaves exactly as before.
+    """
+    ranges = sorted((max(0.0, float(a)), min(float(b), duration))
+                    for a, b in (skip_ranges or []) if float(b) > float(a))
+    spans = []
+    at = 0.0
+    for lo, hi in ranges:
+        if hi <= at:
+            continue
+        if lo > at:
+            spans.append((at, lo))
+        at = max(at, hi)
+    if at < duration:
+        spans.append((at, duration))
+    return spans or [(0.0, duration)]
+
+
+def _apply_drops(words, drops, log):
+    """*words* with the ranges in *drops* removed. See Pair.drop_words.
+
+    Ranges are half-open [start, end) indices into *words*, in any order,
+    and may overlap. Out-of-range ends are clamped rather than rejected:
+    the ranges come from a transcription run against a possibly different
+    copy of the text, and losing the last words of a book to an off-by-one
+    is a worse failure than trimming one word too many.
+    """
+    keep = [True] * len(words)
+    dropped = 0
+    for lo, hi in (drops or []):
+        lo = max(0, int(lo))
+        hi = min(len(words), int(hi))
+        for i in range(lo, hi):
+            if keep[i]:
+                keep[i] = False
+                dropped += 1
+    if not dropped:
+        return words
+    log(f"  Leaving {dropped} word(s) of text unaligned, in "
+        f"{len(drops)} range(s): the recording does not contain them. "
+        f"They still appear in the book, just without highlighting.")
+    return [w for w, k in zip(words, keep) if k]
+
+
 def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
                    progress: ProgressFn, ffmpeg: Optional[str] = None,
                    target_seconds: float = segment_mod.DEFAULT_TARGET,
@@ -306,7 +467,8 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
         raw_wav = raw_dir / f"{stem}.wav"
         audio_mod.convert_to_wav(str(pair.audio), str(raw_wav), ffmpeg)
 
-        words = transcript_words(pair.text)
+        words = _apply_drops(transcript_words(pair.text),
+                             pair.drop_words, log)
         if not words:
             log(f"  Warning: no usable words for '{pair.audio.name}'; skipping.")
             progress((idx + 1) / total, "skipped empty chapter")
@@ -318,8 +480,27 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
             progress((idx + 1) / total, "skipped unreadable audio")
             continue
 
+        if pair.single_utterance:
+            jobs.append(_single_utterance_job(pair, idx, raw_wav, duration,
+                                              corpus_dir, work_dir, ffmpeg,
+                                              words, log))
+            progress((idx + 1) / total, f"prepared {pair.audio.name}")
+            continue
+
         silences = segment_mod.detect_silences(str(raw_wav), ffmpeg, duration)
-        segs = segment_mod.plan_segments(duration, silences, target_seconds, max_seconds)
+        spans = _speech_spans(pair.skip_ranges, duration)
+        if len(spans) > 1 or spans[0][0] > 0 or spans[0][1] < duration:
+            skipped = duration - sum(b - a for a, b in spans)
+            log(f"  Leaving {skipped:.1f}s unaligned across "
+                f"{len(pair.skip_ranges or [])} span(s) with no transcript.")
+        segs = []
+        for span_lo, span_hi in spans:
+            local = [(max(0.0, a - span_lo), b - span_lo)
+                     for a, b in silences if b > span_lo and a < span_hi]
+            for seg in segment_mod.plan_segments(span_hi - span_lo, local,
+                                                 target_seconds, max_seconds):
+                segs.append(segment_mod.Segment(span_lo + seg.start,
+                                                span_lo + seg.end))
         if len(segs) <= 1:
             log(f"  {duration:.1f}s, one utterance (under the {max_seconds:.0f}s cap).")
         else:
@@ -334,10 +515,12 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
         for c_i, (seg, part_words) in enumerate(zip(segs, parts)):
             seg_stem = f"{stem}_{c_i:03d}"
             seg_wav = corpus_dir / f"{seg_stem}.wav"
-            segment_mod.cut_segment(ffmpeg, str(raw_wav), str(seg_wav), seg.start, seg.duration)
+            segment_mod.cut_segment(ffmpeg, str(raw_wav), str(seg_wav),
+                                    seg.start, seg.duration)
             txt = corpus_dir / f"{seg_stem}.txt"
             txt.write_text(words_to_text(part_words), encoding="utf-8")
-            jobs.append(CorpusJob(idx, c_i, str(seg_wav), str(txt), seg.duration))
+            jobs.append(CorpusJob(idx, c_i, str(seg_wav), str(txt),
+                                  start=seg.start, duration=seg.duration))
         progress((idx + 1) / total, f"prepared {pair.audio.name}")
     return jobs
 
@@ -674,6 +857,9 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
         if not pair_jobs:
             continue
         tiers: Dict[str, List[Dict]] = {}
+        # Each segment carries its own absolute position when the segments
+        # aren't contiguous (skipped applause leaves holes). Falling back to
+        # accumulation keeps the old behaviour for anything that doesn't.
         offset = 0.0
         duration = 0.0
         for job in pair_jobs:
@@ -689,11 +875,18 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
                 # drifting early.
                 log(f"  Warning: no alignment for '{Path(job.wav).stem}' "
                     f"({job.duration:.1f}s) -- leaving a gap and continuing.")
-                offset += job.duration
-                duration += job.duration
+                offset = (job.start if job.start is not None else offset) + job.duration
+                duration = max(duration, offset)
                 continue
             parsed = parse_textgrid(tg_path)
-            shifted = _shift(parsed["tiers"], offset)
+            if job.spans:
+                # Built by joining speech spans: times are on the assembled
+                # clock and have to be put back on the file's own.
+                shifted = _map_tiers(parsed["tiers"], job.spans)
+                at = job.spans[0][0]
+            else:
+                at = job.start if job.start is not None else offset
+                shifted = _shift(parsed["tiers"], at)
             for name, intervals in shifted.items():
                 tiers.setdefault(name, []).extend(intervals)
             # Use the PLANNED segment duration -- what we told ffmpeg to cut,
@@ -706,8 +899,8 @@ def postprocess(output_dir: Path, pairs: List[Pair], jobs: List[CorpusJob],
             # little early, and with dozens of segments per chapter that
             # drift compounds into audibly wrong highlighting well before the
             # end of a long chapter.
-            offset += job.duration
-            duration += job.duration
+            offset = (job.spans[-1][1] if job.spans else at + job.duration)
+            duration = max(duration, offset)
             log(f"  Combined '{Path(job.wav).stem}' ({job.duration:.2f}s)")
 
         words = [i for i in tiers.get("words", []) if i["text"]]
@@ -838,6 +1031,27 @@ def _enough_aligned(aligned: int, total: int,
     return aligned >= total * ratio - 1e-9
 
 
+def _try_alignment(*args, **kwargs) -> None:
+    """run_alignment, but a failure inside MFA is not fatal.
+
+    MFA raises NoAlignmentsError when a pass produces nothing at all --
+    which a long utterance does at a narrow beam. Letting that propagate
+    abandoned the whole book on the FIRST pass, so the wider retry tiers
+    below it never ran, even though widening the beam is precisely what
+    MFA's own error message recommends. Treat it like any other empty pass:
+    say so, and let the escalation do its job.
+    """
+    log = kwargs.get("log") or (args[5] if len(args) > 5 else _null_log)
+    try:
+        run_alignment(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        name = type(exc).__name__
+        first = str(exc).strip().splitlines()
+        detail = next((ln for ln in first if ln.strip()), name)
+        log(f"  This pass produced no alignments ({name}: {detail[:120]}). "
+            f"Continuing to a wider beam.")
+
+
 def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                  output_dir: Path,
                  zip_name: Optional[str] = None,
@@ -873,9 +1087,10 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
         temp_dir = work_dir / "mfa_temp"
         progress(0.0, "aligning")
         book_dict = build_dictionary(corpus_dir, dictionary, work_dir, log)
-        run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
-                     log, num_jobs=num_jobs, dictionary_path=book_dict,
-                     beam=DEFAULT_BEAM, retry_beam=DEFAULT_RETRY_BEAM)
+        _try_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
+                       acoustic, log, num_jobs=num_jobs,
+                       dictionary_path=book_dict, beam=DEFAULT_BEAM,
+                       retry_beam=DEFAULT_RETRY_BEAM)
         # An utterance MFA cannot align produces NO output file, and MFA
         # still reports the run as fully successful -- so "fewer files than
         # expected" is the only signal that anything went wrong. A small
@@ -893,6 +1108,11 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
             # leaves output missing.
             {"beam": DEFAULT_BEAM * 2, "retry_beam": DEFAULT_RETRY_BEAM * 2,
              "num_jobs": 1},
+            # Wider again, which is what a LONG utterance needs: the search
+            # has to hold a path across the whole thing, and a six-minute
+            # utterance failed outright at beam 100 while MFA's own error
+            # message suggested exactly these numbers.
+            {"beam": 1000, "retry_beam": 4000, "num_jobs": 1},
         ]
         for tier in tiers:
             if _enough_aligned(len(jobs) - len(missing), len(jobs)):
@@ -901,10 +1121,10 @@ def run_pipeline(pairs: List[Pair], acoustic: str, dictionary: str,
                 f"alignment (MFA reports this as a successful run). Retrying "
                 f"with --beam {tier['beam']} --retry_beam {tier['retry_beam']} "
                 f"--num_jobs {tier['num_jobs']} -- this will take longer.")
-            run_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
-                         acoustic, log, num_jobs=tier["num_jobs"],
-                         dictionary_path=book_dict, beam=tier["beam"],
-                         retry_beam=tier["retry_beam"])
+            _try_alignment(corpus_dir, alignment_dir, temp_dir, dictionary,
+                           acoustic, log, num_jobs=tier["num_jobs"],
+                           dictionary_path=book_dict, beam=tier["beam"],
+                           retry_beam=tier["retry_beam"])
             missing = _missing_textgrids(alignment_dir, jobs)
 
         aligned = len(jobs) - len(missing)

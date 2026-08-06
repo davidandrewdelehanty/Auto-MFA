@@ -567,6 +567,44 @@ class InstallScriptTest(unittest.TestCase):
         # The unrelated book is untouched.
         self.assertTrue(any(e["filename"] == "novel/other.fb2" for e in entries))
 
+    def test_replaces_names_an_earlier_install_under_a_different_slug(self):
+        """The audio folder identifies the book -- but only while the slug
+        stays put. Re-aligning "mp-good" as "moskva-petushki" changes both
+        the FB2 name and the folder, so the old entry has to be named."""
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        data.append({
+            "filename": "novel/erofeev-moskva-petushki.fb2",
+            "title": "Москва — Петушки", "author": "Ерофеев В.В.",
+            "audiobook": {"chapters": ["audio/mp-good/ch000.json"]},
+        })
+        self.index.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        self._chapters(2)
+        proc = self._install(replaces="mp-good")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        entries = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 2, f"book listed twice: {entries}")
+        self.assertFalse(any(e["filename"] == "novel/erofeev-moskva-petushki.fb2"
+                             for e in entries), entries)
+        mine = next(e for e in entries if e["filename"] == "novel/mh.fb2")
+        # The old entry was reused, so the title curated in the repo wins
+        # over the one passed in -- same rule as any other re-install.
+        self.assertEqual(mine["title"], "Москва — Петушки")
+        self.assertEqual(mine["audiobook"]["chapters"],
+                         ["audio/mh/001.json", "audio/mh/002.json"])
+
+    def test_without_replaces_a_renamed_book_would_duplicate(self):
+        """Guards the flag's reason for existing."""
+        data = json.loads(self.index.read_text(encoding="utf-8"))
+        data.append({"filename": "novel/old-name.fb2", "title": "X",
+                     "audiobook": {"chapters": ["audio/other-folder/ch000.json"]}})
+        self.index.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self._chapters(2)
+        self._install()
+        entries = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertTrue(any(e["filename"] == "novel/old-name.fb2" for e in entries))
+
     def test_installs_fb2_chapters_and_catalogue_entry(self):
         self._chapters(3)
         proc = self._install()

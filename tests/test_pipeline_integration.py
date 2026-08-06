@@ -46,7 +46,28 @@ def make_tone_wav(path: Path, seconds: float) -> None:
     )
 
 
-def fake_textgrid(words, start=0.0, step=0.5) -> str:
+def fake_textgrid(words, start=0.0, step=0.5, times=None) -> str:
+    """`times`, when given, is an explicit [(xmin, xmax), ...] per word,
+    for simulating MFA compressing a run of words into too little audio."""
+    if times is not None:
+        lines = ['File type = "ooTextFile"', 'object class = "TextGrid"',
+                 "xmin = 0", "xmax = %f" % (max(b for _, b in times) + 0.1),
+                 "tiers? <exists>", "size = 2",
+                 "item []", "    item [1]:", '        class = "IntervalTier"',
+                 '        name = "words"', "        xmin = 0",
+                 "        xmax = %f" % (max(b for _, b in times) + 0.1),
+                 "        intervals: size = %d" % len(words)]
+        for i, (w, (a, b)) in enumerate(zip(words, times), start=1):
+            lines += [f"        intervals [{i}]:",
+                      f"            xmin = {a:.6f}",
+                      f"            xmax = {b:.6f}",
+                      f'            text = "{w}"']
+        lines += ["item []", "    item [2]:", '        class = "IntervalTier"',
+                  '        name = "phones"', "        xmin = 0",
+                  "        xmax = 1", "        intervals: size = 1",
+                  "        intervals [1]:", "            xmin = 0",
+                  "            xmax = 1", '            text = ""']
+        return "\n".join(lines) + "\n"
     lines = ['File type = "ooTextFile"', 'object class = "TextGrid"',
              "xmin = 0", "xmax = %f" % (start + len(words) * step + step),
              "tiers? <exists>", "size = 2",
@@ -692,3 +713,165 @@ class ChapterBoundaryTest(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertTrue(all(w["text"].startswith("альфа") for w in out[0]["words"]))
         self.assertTrue(all(w["text"].startswith("бета") for w in out[1]["words"]))
+
+
+class StartOffsetTest(unittest.TestCase):
+    """A recording that opens with applause, music or an announcer has
+    audio no transcript accounts for. MFA cannot decline to align there --
+    it forced Брежнев's first six words into the two seconds before the
+    applause even started, at four times human speaking rate.
+    """
+
+    def test_alignment_starts_at_the_offset_and_timings_include_it(self):
+        from app.pipeline import postprocess
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work = root / "work"; work.mkdir()
+        align = root / "align"; align.mkdir()
+        job = CorpusJob(pair_index=0, chunk_index=0,
+                        wav=str(work / "000_a_000.wav"),
+                        txt=str(work / "000_a_000.txt"),
+                        start=26.0, duration=10.0)
+        Path(job.txt).write_text("дорогие товарищи", encoding="utf-8")
+        (align / "000_a_000.TextGrid").write_text(
+            fake_textgrid(["дорогие", "товарищи"]), encoding="utf-8")
+
+        pair = Pair(work / "a.mp3", "T", "дорогие товарищи",
+                    skip_ranges=[(0.0, 26.0)])
+        results = postprocess(align, [pair], [job], log=lambda m: None)
+        first = results[0]["words"][0]
+        self.assertGreaterEqual(first["start"], 26.0,
+                                "the first word must land after the applause")
+
+    def test_no_offset_leaves_timings_at_zero(self):
+        from app.pipeline import postprocess
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work = root / "work"; work.mkdir()
+        align = root / "align"; align.mkdir()
+        job = CorpusJob(pair_index=0, chunk_index=0,
+                        wav=str(work / "000_a_000.wav"),
+                        txt=str(work / "000_a_000.txt"), duration=10.0)
+        Path(job.txt).write_text("дорогие товарищи", encoding="utf-8")
+        (align / "000_a_000.TextGrid").write_text(
+            fake_textgrid(["дорогие", "товарищи"]), encoding="utf-8")
+        results = postprocess(align, [Pair(work / "a.mp3", "T", "дорогие товарищи")],
+                              [job], log=lambda m: None)
+        self.assertLess(results[0]["words"][0]["start"], 1.0)
+
+
+class HardAlignmentFailureTest(unittest.TestCase):
+    """MFA raises NoAlignmentsError when a pass yields nothing -- which a
+    long utterance does at a narrow beam. Letting that propagate abandoned
+    the book on the first pass, so the wider retries never ran, even though
+    a wider beam is what MFA's own message recommends.
+    """
+
+    def test_a_hard_failure_escalates_instead_of_aborting(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work = root / "work"; work.mkdir()
+        out_dir = root / "out"
+        jobs = [CorpusJob(pair_index=0, chunk_index=0,
+                          wav=str(work / "000_a_000.wav"),
+                          txt=str(work / "000_a_000.txt"), duration=10.0)]
+        Path(jobs[0].txt).write_text("слово", encoding="utf-8")
+        beams = []
+
+        def fake(corpus_dir, alignment_dir, temp_dir, dictionary, acoustic,
+                 log, num_jobs=2, dictionary_path=None, beam=None,
+                 retry_beam=None):
+            beams.append(beam)
+            if beam < 1000:
+                raise RuntimeError("NoAlignmentsError: no successful alignments")
+            Path(alignment_dir).mkdir(parents=True, exist_ok=True)
+            (Path(alignment_dir) / "000_a_000.TextGrid").write_text(
+                fake_textgrid(["слово"]), encoding="utf-8")
+
+        with mock.patch("app.pipeline.ensure_models"), \
+             mock.patch("app.pipeline.build_dictionary", return_value=None), \
+             mock.patch("app.pipeline.prepare_corpus", return_value=jobs), \
+             mock.patch("app.pipeline.run_alignment", side_effect=fake):
+            result = run_pipeline(
+                pairs=[Pair(work / "a.mp3", "T", "слово")],
+                acoustic="russian_mfa", dictionary="russian_mfa",
+                output_dir=out_dir, log=lambda m: None)
+        self.assertTrue(result.exists())
+        self.assertEqual(beams[-1], 1000, f"never reached the widest beam: {beams}")
+
+
+class WhyReassigningTextCannotFixBoundariesTest(unittest.TestCase):
+    """Kept as a record of an approach that does NOT work, because it looks
+    obviously right and was implemented before being tested.
+
+    The idea: the transcript is split across utterances proportionally by
+    duration, which assumes a constant speaking rate; so align once, then
+    re-cut the text at the boundaries the first pass measured.
+
+    It cannot work. MFA aligns each utterance independently and must place
+    every word it is given inside that utterance's own audio. So when the
+    proportional split hands utterance 1 ten words the speaker only says
+    five of, MFA reports all ten as occurring within utterance 1 -- crushed
+    into its final seconds, but inside it. Interpolating a boundary from
+    those timings returns the cut it already had. Measured on Брежнев:
+    words 20-34 were reported at 51.84-55.84s against a boundary at 55.8s,
+    so the "corrected" cut is word 34 -- exactly where it was.
+
+    Fixing this means moving the AUDIO cuts to match the text, not the text
+    to match the audio.
+    """
+
+    def test_first_pass_timings_cannot_move_a_boundary(self):
+        # Utterance 1 is 10s and the speaker says 5 words in it; the split
+        # gave it 10. MFA can only report those 10 as inside 0-10s.
+        reported = [(i, min(i * 2.0, 9.8)) for i in range(10)]
+        boundary = 10.0
+        after = [i for i, t in reported if t < boundary]
+        self.assertEqual(len(after), 10,
+                         "every word MFA was given is reported inside the "
+                         "utterance, however wrong that is")
+
+
+
+
+class SingleUtteranceMappingTest(unittest.TestCase):
+    """Joining the speech spans removes the proportional split, but the
+    alignment then comes back on the assembled clock -- with the applause
+    gone -- and has to be put back on the file the listener has.
+    """
+
+    def test_times_map_back_across_the_removed_gaps(self):
+        from app.pipeline import _map_to_original
+        spans = [(25.8, 78.9), (86.8, 123.4)]      # 53.1s then 36.6s
+        self.assertAlmostEqual(_map_to_original(0.0, spans), 25.8, places=3)
+        self.assertAlmostEqual(_map_to_original(53.1, spans), 78.9, places=3)
+        # Just past the join: back on the far side of the applause.
+        self.assertAlmostEqual(_map_to_original(53.2, spans), 86.9, places=3)
+        self.assertAlmostEqual(_map_to_original(89.7, spans), 123.4, places=3)
+
+    def test_postprocess_uses_the_map(self):
+        from app.pipeline import postprocess
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        work = root / "work"; work.mkdir()
+        align = root / "align"; align.mkdir()
+        spans = [(25.8, 30.8), (100.0, 105.0)]
+        job = CorpusJob(pair_index=0, chunk_index=0,
+                        wav=str(work / "000_a_000.wav"),
+                        txt=str(work / "000_a_000.txt"),
+                        start=0.0, spans=spans, duration=10.0)
+        Path(job.txt).write_text("раз два три", encoding="utf-8")
+        # words at 0.5s, 3.0s and 7.0s on the assembled clock
+        (align / "000_a_000.TextGrid").write_text(
+            fake_textgrid(["раз", "два", "три"],
+                          times=[(0.5, 0.7), (3.0, 3.2), (7.0, 7.2)]),
+            encoding="utf-8")
+        res = postprocess(align, [Pair(work / "a.mp3", "T", "раз два три")],
+                          [job], log=lambda m: None)
+        got = [round(w["start"], 2) for w in res[0]["words"]]
+        # 0.5 -> 26.3, 3.0 -> 28.8 (both in span 1), 7.0 -> 102.0 (span 2)
+        self.assertEqual(got, [26.3, 28.8, 102.0])

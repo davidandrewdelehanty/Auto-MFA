@@ -85,7 +85,11 @@ def cmd_align(args: List[str]) -> int:
         Pair(Path(p["audio"]), p.get("title", ""), p["text"],
              sub_chapters=[tuple(sc) for sc in p["sub_chapters"]]
              if p.get("sub_chapters") else None,
-             sub_texts=p.get("sub_texts") or None)
+             sub_texts=p.get("sub_texts") or None,
+             skip_ranges=[tuple(r) for r in (p.get("skip_ranges") or [])] or None,
+             single_utterance=bool(p.get("single_utterance")),
+             drop_words=[tuple(r) for r in (p.get("drop_words") or [])]
+             or None)
         for p in job["pairs"]
     ]
     if not pairs:
