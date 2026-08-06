@@ -68,6 +68,60 @@ done < "$STAGE_LIST"
 """
 
 
+PAREN_OPEN = "(["
+PAREN_CLOSE = ")]"
+
+
+def parenthetical_ranges(text):
+    """Word-index ranges of the bracketed asides in *text*.
+
+    In a play, parenthesised material is a stage direction: "(смеется)",
+    "(в отчаянии)", "(Смотрит на часы.)", "(подводит Тригорина к шкапу)".
+    A radio production performs none of it, but it sits in the FB2 among the
+    dialogue, so the aligner is obliged to find room for it in the actors'
+    voices -- and drags the real lines either side out of place doing so.
+
+    tools/asr_check.py cannot reach these. It only reports runs of five
+    words or more, because below that a recogniser's mishearing is
+    indistinguishable from an omission, and most of these are one or two
+    words. But they do not need a recogniser: the brackets say what they
+    are. This is structural, so it is exact -- no room measurement, no
+    threshold, nothing to be wrong about.
+
+    Returns half-open [start, end) ranges into fb2.transcript_words(text),
+    ready for Pair.drop_words.
+    """
+    depth = 0
+    inside = []             # one flag per normalized word
+    for token in (text or "").split():
+        n_before = depth
+        letters_in = letters = 0
+        for ch in token:
+            if ch in PAREN_OPEN:
+                depth += 1
+            elif ch in PAREN_CLOSE:
+                depth = max(0, depth - 1)
+            elif ch.isalnum():
+                letters += 1
+                if depth > 0:
+                    letters_in += 1
+        # A token belongs to the aside if most of its letters sat inside the
+        # brackets. That keeps the opening and closing tokens ("(смеется)."),
+        # while a token that merely follows a closing bracket stays out.
+        held = letters_in * 2 >= letters if letters else (n_before > 0)
+        for _ in transcript_words(token):
+            inside.append(held)
+
+    ranges, start = [], None
+    for i, flag in enumerate(inside + [False]):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            ranges.append((start, i))
+            start = None
+    return ranges
+
+
 def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
           title: str = "", author: str = "", narrator: str = "audiobook",
           num_jobs: int = 2, as_folder: str = "",
@@ -75,7 +129,8 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
           category: str = "Works", source_note: str = "owned recording",
           concat: bool = False, order=None, skip_intro: float = 0.0,
           utterance_seconds: float = 0.0, skip=None,
-          single_utterance: bool = False, drop=None) -> Path:
+          single_utterance: bool = False, drop=None,
+          asr_json: str = "", drop_parens: bool = False) -> Path:
     """Generate the run for the book in *folder*.
 
     *as_folder*, when given, is the path written INTO the generated scripts
@@ -179,8 +234,23 @@ def build(folder: Path, slug: str, r2_folder: str, repo: str, work: Path,
             # The mirror image: text the recording does not contain. See
             # Pair.drop_words in pipeline.py, and tools/asr_check.py,
             # which transcribes the audio and prints these ranges.
-            if drop:
-                pair["drop_words"] = [[a, b] for a, b in sorted(drop)]
+            ranges = list(drop or [])
+            if drop_parens:
+                found = parenthetical_ranges(pair["text"])
+                words = transcript_words(pair["text"])
+                n = sum(b - a for a, b in found)
+                print(f"  Bracketed asides: {len(found)} passage(s), {n} word(s) "
+                      f"({100.0 * n / max(1, len(words)):.1f}% of the text)")
+                for a, b in found[:6]:
+                    print(f"    {' '.join(words[a:b])[:70]}")
+                ranges += found
+            if ranges:
+                pair["drop_words"] = [[a, b] for a, b in sorted(ranges)]
+            # Where to cut the transcript between utterances. See
+            # Pair.asr_words: the timings never reach the output, they only
+            # replace the assumption that everyone speaks at one rate.
+            if asr_json:
+                pair["asr_json"] = str(asr_json)
         if len(span) > 1:
             pair["sub_chapters"] = [[c["title"], len(transcript_words(c["text"]))]
                                     for c in span]
@@ -398,6 +468,17 @@ def main() -> int:
                          "recording does not contain (e.g. 268-346), as "
                          "printed by tools/asr_check.py. The book still "
                          "shows the words; they just carry no timing.")
+    ap.add_argument("--drop-parens", action="store_true",
+                    help="leave bracketed asides out of the alignment. For a\n"
+                         "play: \"(смеется)\", \"(Смотрит на часы.)\" are stage\n"
+                         "directions nobody speaks. They still show in the book.")
+    ap.add_argument("--asr-json", default="",
+                    help="path to the transcription cached by "
+                         "tools/asr_check.py --asr-json. Long "
+                         "recordings are cut into utterances and "
+                         "the text divided between them; with this "
+                         "the text is cut where the words actually "
+                         "fall instead of by duration.")
     ap.add_argument("--order", default="",
                     help="true reading order of the audio, as comma-separated "
                          "1-based positions in the sorted listing "
@@ -439,6 +520,7 @@ def main() -> int:
           single_utterance=a.single_utterance,
           drop=[tuple(int(x) for x in part.split('-', 1))
                 for part in a.drop.split(',') if part.strip()],
+          asr_json=a.asr_json, drop_parens=a.drop_parens,
           utterance_seconds=a.utterance_seconds)
     return 0
 

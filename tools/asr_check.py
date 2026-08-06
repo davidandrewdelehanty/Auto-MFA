@@ -341,6 +341,16 @@ def main():
     ap.add_argument("--chapter", type=int, default=0,
                     help="1-based chapter this audio file holds "
                          "(default: the only one)")
+    ap.add_argument("--all-chapters", action="store_true",
+                    help="one recording holds the WHOLE book, joined (a play "
+                         "recorded in one sitting, a --concat run). Compares "
+                         "against every chapter's text joined in order, which "
+                         "is exactly what such a pair feeds the aligner, so "
+                         "the --drop indices line up with it.")
+    ap.add_argument("--drop-file", default="",
+                    help="write the --drop value to this file (empty if "
+                         "nothing is missing), for feeding straight into "
+                         "make_book_run.py without reading the report first")
     ap.add_argument("--asr-json", default="",
                     help="cache the transcription here, and reuse it if the "
                          "file already exists")
@@ -364,13 +374,21 @@ def main():
 
     fb2_path = Path(a.fb2)
     chapters = fb2_mod.extract_chapters(fb2_path)
-    if a.chapter:
+    if a.all_chapters:
+        chapter = {"title": f"{len(chapters)} chapters joined",
+                   "text": " ".join(c["text"] for c in chapters)}
+    elif a.chapter:
         chapter = chapters[a.chapter - 1]
     elif len(chapters) == 1:
         chapter = chapters[0]
     else:
         raise SystemExit(f"{fb2_path.name} has {len(chapters)} chapters; "
-                         f"say which one with --chapter N.")
+                         f"say which one with --chapter N, or --all-chapters "
+                         f"if one recording holds them all.")
+
+    def write_drop(value=""):
+        if a.drop_file:
+            Path(a.drop_file).write_text(value, encoding="utf-8")
 
     cache = Path(a.asr_json) if a.asr_json else None
     if cache and cache.exists():
@@ -394,6 +412,7 @@ def main():
     if not runs:
         print("\nNothing missing. Every run of the text has a counterpart in "
               "the audio, so the whole text can be aligned.")
+        write_drop()
         return 0
 
     voiced, duration = (None, 0.0)
@@ -436,10 +455,13 @@ def main():
     if not absent_runs:
         print("Nothing is missing from the recording -- every hole is the "
               "recogniser's, and the text should be aligned whole.")
+        write_drop()
         return 0
 
+    spec = ",".join(f"{lo}-{hi}" for lo, hi in absent_runs)
     print("Pass to make_book_run.py as:")
-    print("   --drop " + ",".join(f"{lo}-{hi}" for lo, hi in absent_runs))
+    print("   --drop " + spec)
+    write_drop(spec)
 
     # Whole sentences only: a sentence with most of its words unheard is one
     # the recording does not have, and half a sentence highlighted then

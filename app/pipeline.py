@@ -122,6 +122,19 @@ class Pair:
     # resumes on the far side of the hole. tools/asr_check.py finds these
     # ranges by transcribing the audio and diffing it against the text.
     drop_words: Optional[List[Tuple[int, int]]] = None
+    # A rough transcription of this pair's audio -- [{"word", "start"}, ...]
+    # in order, as tools/asr_check.py caches it. Used ONLY to decide where to
+    # cut the transcript between utterances; not a single timing from it
+    # reaches the output, which still comes entirely from MFA.
+    #
+    # Without it the transcript is divided between utterances in proportion
+    # to their duration, which assumes a constant speaking rate. Measured on
+    # Чайка (a radio production, six actors, 210 utterances): over half the
+    # utterances got a word count more than ten out, the worst by 82 -- two
+    # 45-second chunks truly holding 134 words and 27 were each handed 72.
+    # A chunk given too many words crushes them, a chunk given too few
+    # stretches them, and both errors push the next chunk further out.
+    asr_words: Optional[List[Dict]] = None
 
 
 @dataclass
@@ -409,6 +422,76 @@ def _speech_spans(skip_ranges, duration: float):
     return spans or [(0.0, duration)]
 
 
+def _anchor_times(words, asr_words, duration, log,
+                  min_anchored=0.40):
+    """Approximate time for every word in *words*, or None to fall back.
+
+    The transcript and the transcription are matched with difflib -- they
+    are never the same sequence, since the recogniser mishears, skips what
+    it cannot hear over music, and hears asides the book does not print.
+    Matched words take the recogniser's time; the rest are interpolated
+    between their neighbours by position, which is exactly the constant-rate
+    assumption the proportional split makes -- but applied over the few
+    words between two anchors instead of over a whole 45-second chunk.
+
+    Forced monotonic afterwards: the recogniser occasionally emits a word
+    with a time earlier than the one before it, and a non-monotonic array
+    would make bisect cut the text in the wrong place.
+
+    Returns None when too little of the text could be anchored, so a bad
+    transcription degrades to the old behaviour rather than to nonsense.
+    """
+    asr, times = [], []
+    for w in (asr_words or []):
+        for piece in transcript_words(str(w.get("word", ""))):
+            asr.append(piece)
+            times.append(float(w.get("start", 0.0)))
+    if not asr or not words:
+        return None
+
+    matcher = difflib.SequenceMatcher(None, words, asr, autojunk=False)
+    at = [None] * len(words)
+    anchored = 0
+    for i, j, size in matcher.get_matching_blocks():
+        for k in range(size):
+            at[i + k] = times[j + k]
+            anchored += 1
+
+    share = anchored / len(words)
+    if share < min_anchored:
+        log(f"  Only {share:.0%} of the text could be placed against the "
+            f"transcription; falling back to the proportional split.")
+        return None
+
+    known = [i for i, v in enumerate(at) if v is not None]
+    out = []
+    for i in range(len(words)):
+        if at[i] is not None:
+            out.append(at[i])
+            continue
+        j = bisect.bisect_left(known, i)
+        lo_i, lo_t = (known[j - 1], at[known[j - 1]]) if j > 0 else (-1, 0.0)
+        hi_i, hi_t = (known[j], at[known[j]]) if j < len(known) else (len(words), duration)
+        span = hi_i - lo_i
+        out.append(lo_t + (hi_t - lo_t) * ((i - lo_i) / span) if span else lo_t)
+    for i in range(1, len(out)):
+        if out[i] < out[i - 1]:
+            out[i] = out[i - 1]
+    log(f"  Placed {anchored}/{len(words)} words ({share:.0%}) against the "
+        f"transcription; cutting the text where they fall.")
+    return out
+
+
+def _partition_by_times(words, segs, word_times):
+    """Split *words* between *segs* at the boundary each segment ends on."""
+    cuts = [bisect.bisect_left(word_times, s.end) for s in segs[:-1]]
+    edges = [0] + cuts + [len(words)]
+    for i in range(1, len(edges)):
+        if edges[i] < edges[i - 1]:
+            edges[i] = edges[i - 1]
+    return [words[a:b] for a, b in zip(edges, edges[1:])]
+
+
 def _apply_drops(words, drops, log):
     """*words* with the ranges in *drops* removed. See Pair.drop_words.
 
@@ -510,7 +593,16 @@ def prepare_corpus(pairs: List[Pair], work_dir: Path, log: LogFn,
                 f"(~{target_seconds:.0f}s target, {snapped} silence-snapped cuts).")
 
         weights = [s.duration for s in segs]
-        parts = chunking.partition_words_by_weights(words, weights)
+        word_times = _anchor_times(words, pair.asr_words, duration, log) \
+            if pair.asr_words else None
+        if word_times and len(segs) > 1:
+            parts = _partition_by_times(words, segs, word_times)
+            guess = chunking.partition_words_by_weights(words, weights)
+            moved = sum(abs(len(a) - len(b)) for a, b in zip(parts, guess))
+            log(f"  That moved {moved} word(s) across utterance boundaries "
+                f"compared with splitting by duration.")
+        else:
+            parts = chunking.partition_words_by_weights(words, weights)
 
         for c_i, (seg, part_words) in enumerate(zip(segs, parts)):
             seg_stem = f"{stem}_{c_i:03d}"

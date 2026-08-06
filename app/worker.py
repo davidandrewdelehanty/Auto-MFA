@@ -77,6 +77,23 @@ def _fail(msg: str) -> int:
     return 1
 
 
+def _load_asr(path):
+    """The cached transcription for one pair, or None.
+
+    Held as a path rather than inlined in the job file: a two-hour play
+    transcribes to about half a megabyte, and a job file is meant to stay
+    readable by the person debugging a run.
+    """
+    if not path:
+        return None
+    f = Path(path)
+    if not f.exists():
+        print(f"@STATUS|  Note: no transcription at {path}; the transcript "
+              f"will be split by duration instead.", flush=True)
+        return None
+    return json.loads(f.read_text(encoding="utf-8"))
+
+
 def cmd_align(args: List[str]) -> int:
     if len(args) < 1:
         return _fail("usage: worker align <jobfile.json>")
@@ -89,7 +106,8 @@ def cmd_align(args: List[str]) -> int:
              skip_ranges=[tuple(r) for r in (p.get("skip_ranges") or [])] or None,
              single_utterance=bool(p.get("single_utterance")),
              drop_words=[tuple(r) for r in (p.get("drop_words") or [])]
-             or None)
+             or None,
+             asr_words=_load_asr(p.get("asr_json")))
         for p in job["pairs"]
     ]
     if not pairs:
